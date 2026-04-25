@@ -1,0 +1,13 @@
+# ninja log v6
+10	636	7988171320151324	CMakeFiles/xdl_core.dir/src/page.cpp.obj	2c88e5f84560621e
+17	643	7988171320216676	CMakeFiles/xdl_core.dir/src/compression.cpp.obj	70d865fafc1f21d1
+36	726	7988171320398189	CMakeFiles/xdl_core.dir/src/index.cpp.obj	677218ac26e69c69
+29	779	7988171320332517	CMakeFiles/xdl_core.dir/src/cache.cpp.obj	7285eb787be9cdbb
+23	902	7988171320272192	CMakeFiles/xdl_core.dir/src/storage.cpp.obj	7dfd79a2edb75a38
+51	1042	7988171320555307	CMakeFiles/xdl_core.dir/src/db.cpp.obj	28550f3f18846216
+45	1065	7988171320479327	CMakeFiles/xdl_core.dir/src/pager.cpp.obj	2254afb4ed05d073
+66	1356	7988171320708191	CMakeFiles/xdl_tests.dir/tests/test_xdl.cpp.obj	c47205633a468a27
+41	275	7988171983739561	xdl_core.lib	ab153ff5506dec56
+276	896	7988171986075627	xdl_tests.exe	d78d71362ba2f55f
+17	929	7988173633504186	CMakeFiles/xdl.dir/src/main.cpp.obj	5caaa3d92ecfd08
+930	1590	7988173642634527	xdl.exe	1a5964c905bd16d7

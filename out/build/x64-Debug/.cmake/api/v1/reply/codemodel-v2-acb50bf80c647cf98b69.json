@@ -1,0 +1,80 @@
+{
+	"configurations" : 
+	[
+		{
+			"abstractTargets" : [],
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-Debug-559b93845b88052e9091.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2
+					]
+				}
+			],
+			"name" : "Debug",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "xdl",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "xdl::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-xdl-Debug-cd96a0d4d3292955dbae.json",
+					"name" : "xdl",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "xdl_core::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-xdl_core-Debug-c0d53116a008801458ce.json",
+					"name" : "xdl_core",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "xdl_tests::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-xdl_tests-Debug-440214902b815d15c26c.json",
+					"name" : "xdl_tests",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "C:/Users/bayas/Projects/xdl/out/build/x64-Debug",
+		"source" : "C:/Users/bayas/Projects/xdl"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 9
+	}
+}

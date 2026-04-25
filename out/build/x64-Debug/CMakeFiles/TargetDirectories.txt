@@ -1,0 +1,9 @@
+C:/Users/bayas/Projects/xdl/out/build/x64-Debug/CMakeFiles/xdl_core.dir
+C:/Users/bayas/Projects/xdl/out/build/x64-Debug/CMakeFiles/xdl.dir
+C:/Users/bayas/Projects/xdl/out/build/x64-Debug/CMakeFiles/xdl_tests.dir
+C:/Users/bayas/Projects/xdl/out/build/x64-Debug/CMakeFiles/test.dir
+C:/Users/bayas/Projects/xdl/out/build/x64-Debug/CMakeFiles/edit_cache.dir
+C:/Users/bayas/Projects/xdl/out/build/x64-Debug/CMakeFiles/rebuild_cache.dir
+C:/Users/bayas/Projects/xdl/out/build/x64-Debug/CMakeFiles/list_install_components.dir
+C:/Users/bayas/Projects/xdl/out/build/x64-Debug/CMakeFiles/install.dir
+C:/Users/bayas/Projects/xdl/out/build/x64-Debug/CMakeFiles/install/local.dir
