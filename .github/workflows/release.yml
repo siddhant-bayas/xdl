@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  linux-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static release
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DXDL_BUILD_CLI=ON -DXDL_BUILD_BENCH=ON \
+            -DXDL_STATIC_LINK=ON
+          cmake --build build -j$(nproc)
+
+      - name: Package Linux binary
+        run: |
+          mkdir -p release
+          cp build/xdl release/xdl-linux-amd64
+          tar -czf xdl-${{ github.ref_name }}-linux-amd64.tar.gz -C release xdl-linux-amd64
+
+      - name: Upload Linux binary
+        uses: softprops/action-gh-release@v2
+        with:
+          files: xdl-${{ github.ref_name }}-linux-amd64.tar.gz
+
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -B build -DXDL_BUILD_CLI=ON
+          cmake --build build --config Release
+
+      - name: Package Windows binary
+        run: 7z a xdl-${{ github.ref_name }}-windows-amd64.zip build/Release/xdl.exe
+
+      - name: Upload Windows binary
+        uses: softprops/action-gh-release@v2
+        with:
+          files: xdl-${{ github.ref_name }}-windows-amd64.zip
+
+  packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DXDL_BUILD_CLI=ON
+          cmake --build build -j$(nproc)
+
+      - name: Package .deb and .rpm
+        run: |
+          cd build && cpack -G DEB -G RPM
+
+      - name: Upload packages
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/xdl-*.deb
+            build/xdl-*.rpm

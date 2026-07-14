@@ -1,0 +1,65 @@
+# Build artifacts
+build/
+build_win/
+build_wsl/
+cmake-build-*/
+out/
+*.o
+*.a
+*.obj
+
+# Compiled binaries
+/xdl
+/xdl_tests
+/xdl_new_tests
+/xdl_core
+/xdl_bench
+*.exe
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# IDE files
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+CMakeUserPresets.json
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary test files (legacy /tmp paths)
+/tmp/_*.xdl
+/tmp/_*.wal
+/tmp/xdl_*
+/tmp/_t_*
+/tmp/_dbg*
+/tmp/_ntest*
+
+# CMake generated files (when building in-source)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+_deps/
+Testing/
+install_manifest.txt
+
+# CPack
+CPackConfig.cmake
+CPackSourceConfig.cmake
+CPack/
+_cpack_*
+
+# Package artifacts
+*.deb
+*.rpm
+*.tar.gz
+*.tgz

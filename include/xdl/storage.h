@@ -3,7 +3,6 @@
 #include "types.h"
 #include "page.h"
 #include <string>
-#include <fstream>
 
 namespace xdl {
 
@@ -19,6 +18,9 @@ struct DBHeader {
     uint32_t page_count;      // number of data pages written
     uint8_t  compression;     // default CompressionType for new pages
     uint8_t  _pad[3];
+    // Schema serialisation follows the fixed header.
+    // schema_data_offset = sizeof(DBHeader)  (i.e. right after this struct)
+    // schema_data_length stored as uint32_t before the schema bytes.
 };
 #pragma pack(pop)
 
@@ -40,8 +42,27 @@ public:
     // Non-copyable, moveable
     StorageEngine(const StorageEngine&)            = delete;
     StorageEngine& operator=(const StorageEngine&) = delete;
-    StorageEngine(StorageEngine&&)                 = default;
-    StorageEngine& operator=(StorageEngine&&)      = default;
+
+    StorageEngine(StorageEngine&& o) noexcept
+        : path_(std::move(o.path_)), compression_(o.compression_),
+          fd_(o.fd_), open_(o.open_)
+    {
+        o.fd_ = -1;
+        o.open_ = false;
+    }
+
+    StorageEngine& operator=(StorageEngine&& o) noexcept {
+        if (this != &o) {
+            if (open_) close();
+            path_       = std::move(o.path_);
+            compression_ = o.compression_;
+            fd_         = o.fd_;
+            open_       = o.open_;
+            o.fd_       = -1;
+            o.open_     = false;
+        }
+        return *this;
+    }
 
     // Open existing or create new database file
     void open();
@@ -61,6 +82,13 @@ public:
     DBHeader  read_db_header();
     void      write_db_header(const DBHeader& hdr);
 
+    // Schema storage: read/write serialised schema after the DB header
+    void      write_schema(const Schema& schema);
+    Schema    read_schema();
+
+    // Return the file offset where data pages begin (after header + schema blob).
+    uint64_t  data_start_offset() const;
+
     uint64_t  file_size() const;
     const std::string& path() const { return path_; }
     CompressionType    default_compression() const { return compression_; }
@@ -68,7 +96,7 @@ public:
 private:
     std::string     path_;
     CompressionType compression_;
-    std::fstream    file_;
+    int             fd_ = -1;
     bool            open_ = false;
 };
 

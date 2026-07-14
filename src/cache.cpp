@@ -8,24 +8,35 @@ PageCache::PageCache(size_t capacity, EvictionCb on_evict)
     if (capacity_ == 0) capacity_ = 1;
 }
 
-Page* PageCache::get(uint32_t page_id) {
+std::optional<Page> PageCache::get(uint32_t page_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto it = map_.find(page_id);
+    if (it == map_.end()) return std::nullopt;
+
+    lru_.splice(lru_.begin(), lru_, it->second);
+    return *it->second;  // copy made under lock
+}
+
+Page* PageCache::get_mut(uint32_t page_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
     auto it = map_.find(page_id);
     if (it == map_.end()) return nullptr;
 
-    // Move to front (most recently used)
     lru_.splice(lru_.begin(), lru_, it->second);
     return &(*it->second);
 }
 
 void PageCache::put(Page page) {
+    std::lock_guard<std::mutex> lock(mtx_);
     uint32_t pid = page.id;
 
     // If already cached, update in place and move to front
     auto it = map_.find(pid);
     if (it != map_.end()) {
-        it->second->data      = std::move(page.data);
-        it->second->row_count = page.row_count;
-        it->second->dirty     = page.dirty;
+        it->second->data        = std::move(page.data);
+        it->second->row_count   = page.row_count;
+        it->second->dirty       = page.dirty;
+        it->second->row_offsets = std::move(page.row_offsets);
         lru_.splice(lru_.begin(), lru_, it->second);
         return;
     }
@@ -38,6 +49,7 @@ void PageCache::put(Page page) {
 }
 
 void PageCache::evict(uint32_t page_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
     auto it = map_.find(page_id);
     if (it == map_.end()) return;
     if (on_evict_ && it->second->dirty) on_evict_(*it->second);
@@ -46,6 +58,7 @@ void PageCache::evict(uint32_t page_id) {
 }
 
 void PageCache::flush_all() {
+    std::lock_guard<std::mutex> lock(mtx_);
     if (on_evict_) {
         for (auto& page : lru_) {
             if (page.dirty) on_evict_(page);
@@ -61,6 +74,11 @@ void PageCache::evict_lru() {
     if (on_evict_ && victim.dirty) on_evict_(victim);
     map_.erase(victim.id);
     lru_.pop_back();
+}
+
+size_t PageCache::size() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return map_.size();
 }
 
 } // namespace xdl

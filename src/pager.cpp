@@ -1,75 +1,119 @@
 #include "xdl/pager.h"
 #include <stdexcept>
+#include <algorithm>
 
 namespace xdl {
 
-Pager::Pager(StorageEngine& storage, IndexManager& index, size_t cache_capacity)
-    : storage_(storage), index_(index),
+// Fixed slot size for each page: max uncompressed data + header.
+static constexpr uint64_t PAGE_SLOT_SIZE = sizeof(PageHeader) + PAGE_SIZE;
+
+static uint64_t page_file_offset(uint64_t data_start, uint32_t page_id) {
+    return data_start + static_cast<uint64_t>(page_id) * PAGE_SLOT_SIZE;
+}
+
+Pager::Pager(StorageEngine& storage, IndexManager& index,
+             WAL& wal, const Schema& schema, size_t cache_capacity)
+    : storage_(storage), index_(index), wal_(wal), schema_(schema),
       cache_(cache_capacity, [this](Page& p){ this->on_cache_evict(p); })
 {}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// recover()  — called once after the storage file is opened.
-//
-// Scans every page sequentially and rebuilds the in-memory index.
-// Also populates page_offsets_ so we know where each page lives on disk.
+// rebuild_row_offsets()
+// ─────────────────────────────────────────────────────────────────────────────
+
+void Pager::rebuild_row_offsets(Page& page) const {
+    page.row_offsets.clear();
+    page.row_offsets.reserve(page.row_count);
+    uint32_t pos = 0;
+    for (uint32_t i = 0; i < page.row_count; ++i) {
+        if (pos + 4 > page.data.size())
+            throw CorruptionError("Page data truncated while rebuilding row offsets");
+        page.row_offsets.push_back(pos);
+        uint32_t row_len = serialise::read_u32(page.data.data() + pos);
+        pos += row_len;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// recover()
 // ─────────────────────────────────────────────────────────────────────────────
 
 void Pager::recover() {
     DBHeader dbhdr = storage_.read_db_header();
     uint32_t disk_page_count = dbhdr.page_count;
-
-    uint64_t offset = sizeof(DBHeader);
+    uint64_t data_start = storage_.data_start_offset();
     uint64_t file_sz = storage_.file_size();
 
-    uint32_t pages_seen = 0;
+    for (uint32_t pid = 0; pid < disk_page_count; ++pid) {
+        uint64_t offset = page_file_offset(data_start, pid);
+        if (offset + sizeof(PageHeader) > file_sz) break;
 
-    while (offset + sizeof(PageHeader) <= file_sz && pages_seen < disk_page_count) {
         PageHeader hdr{};
         std::vector<char> blob;
-        storage_.read_page_raw(offset, hdr, blob);
+        try {
+            storage_.read_page_raw(offset, hdr, blob);
+        } catch (...) { continue; }
 
-        // Decompress to read row metadata for index rebuild
+        if (hdr.page_id != pid) continue;
+
         CompressionType ct = static_cast<CompressionType>(hdr.compression_type);
         std::vector<char> uncompressed(hdr.uncompressed_size);
-        CompressionEngine::decompress(ct,
-            blob.data(), blob.size(),
-            uncompressed.data(), uncompressed.size());
+        try {
+            CompressionEngine::decompress(ct,
+                blob.data(), blob.size(),
+                uncompressed.data(), uncompressed.size());
+        } catch (...) { continue; }
 
         Page page(hdr.page_id);
         page.data      = std::move(uncompressed);
         page.row_count = hdr.row_count;
 
-        // Rebuild index entries for every row in this page
+        rebuild_row_offsets(page);
+
         for (uint32_t slot = 0; slot < page.row_count; ++slot) {
-            Row r = page.get_row(slot);
+            Row r = page.get_row(slot, schema_);
             IndexEntry entry{ hdr.page_id, offset, slot };
             try {
                 index_.insert(r.id, entry);
             } catch (DuplicateKeyError&) {
-                // On-disk corruption — skip duplicate; could log here
+                // skip duplicate
             }
         }
 
         page_offsets_[hdr.page_id] = offset;
-        offset += sizeof(PageHeader) + hdr.compressed_size;
         next_page_id_ = std::max(next_page_id_, hdr.page_id + 1);
-        ++pages_seen;
     }
+
+    // Prepare index for fast lookups after bulk load
+    index_.prepare();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// get_page()
+// get_page() — returns a copy, safe for concurrent readers
 // ─────────────────────────────────────────────────────────────────────────────
 
-Page& Pager::get_page(uint32_t page_id) {
-    Page* cached = cache_.get(page_id);
+Page Pager::get_page(uint32_t page_id) {
+    auto cached = cache_.get(page_id);
     if (cached) return *cached;
 
-    // Not in cache — load from disk
+    Page page = load_from_disk(page_id);
+    Page result = page;               // copy before moving into cache
+    cache_.put(std::move(page));
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// get_mutable_page() — returns reference into cache, caller must hold
+// exclusive lock
+// ─────────────────────────────────────────────────────────────────────────────
+
+Page& Pager::get_mutable_page(uint32_t page_id) {
+    Page* cached = cache_.get_mut(page_id);
+    if (cached) return *cached;
+
     Page page = load_from_disk(page_id);
     cache_.put(std::move(page));
-    return *cache_.get(page_id);
+    return *cache_.get_mut(page_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,11 +125,11 @@ Page& Pager::new_page() {
     Page page(pid);
     page.dirty = true;
     cache_.put(std::move(page));
-    return *cache_.get(pid);
+    return *cache_.get_mut(pid);
 }
 
 void Pager::mark_dirty(uint32_t page_id) {
-    Page* p = cache_.get(page_id);
+    Page* p = cache_.get_mut(page_id);
     if (p) p->dirty = true;
 }
 
@@ -94,34 +138,31 @@ void Pager::mark_dirty(uint32_t page_id) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void Pager::flush_page(uint32_t page_id) {
-    Page* p = cache_.get(page_id);
+    Page* p = cache_.get_mut(page_id);
     if (!p || !p->dirty) return;
     uint64_t new_offset = write_page_to_disk(*p);
 
-    // Update all index entries pointing to this page with new offset
-    index_.for_each([&](uint32_t id, const IndexEntry& e){
-        if (e.page_id == page_id) {
-            const_cast<IndexEntry&>(e).page_offset = new_offset;
-        }
-    });
+    // Batch update: update all index entries for this page at once
+    index_.update_offsets_for_page(page_id, new_offset);
 
     p->dirty = false;
 }
 
 void Pager::flush_all() {
-    cache_.for_each_dirty([this](Page& p){
-        if (p.dirty) {
-            uint64_t new_offset = write_page_to_disk(p);
-            index_.for_each([&](uint32_t id, const IndexEntry& e){
-                if (e.page_id == p.id) {
-                    const_cast<IndexEntry&>(e).page_offset = new_offset;
-                }
-            });
-            p.dirty = false;
-        }
+    // Collect all dirty pages first, then flush
+    std::vector<uint32_t> dirty_pages;
+    cache_.for_each_dirty([this, &dirty_pages](Page& p) {
+        if (p.dirty) dirty_pages.push_back(p.id);
     });
 
-    // Update DB header with current page count
+    for (uint32_t pid : dirty_pages) {
+        Page* p = cache_.get_mut(pid);
+        if (!p || !p->dirty) continue;
+        uint64_t new_offset = write_page_to_disk(*p);
+        index_.update_offsets_for_page(pid, new_offset);
+        p->dirty = false;
+    }
+
     DBHeader dbhdr = storage_.read_db_header();
     dbhdr.page_count = next_page_id_;
     storage_.write_db_header(dbhdr);
@@ -155,6 +196,8 @@ Page Pager::load_from_disk(uint32_t page_id) {
     page.data      = std::move(uncompressed);
     page.row_count = hdr.row_count;
     page.dirty     = false;
+
+    rebuild_row_offsets(page);
     return page;
 }
 
@@ -171,29 +214,12 @@ uint64_t Pager::write_page_to_disk(Page& page) {
     hdr.row_count         = page.row_count;
     hdr.compression_type  = static_cast<uint8_t>(ct);
 
-    uint64_t offset;
-    auto it = page_offsets_.find(page.id);
-    if (it != page_offsets_.end()) {
-        // Overwrite only if compressed size fits (otherwise append and update offset)
-        PageHeader old_hdr{};
-        std::vector<char> dummy;
-        storage_.read_page_raw(it->second, old_hdr, dummy);
+    uint64_t data_start = storage_.data_start_offset();
+    uint64_t offset = page_file_offset(data_start, page.id);
 
-        if (comp_size <= old_hdr.compressed_size) {
-            // Pad to original size to maintain file layout
-            compressed.resize(old_hdr.compressed_size, 0);
-            hdr.compressed_size = old_hdr.compressed_size;
-            storage_.overwrite_page_raw(it->second, hdr, compressed);
-            offset = it->second;
-        } else {
-            offset = storage_.append_page_raw(hdr, compressed);
-            page_offsets_[page.id] = offset;
-        }
-    } else {
-        offset = storage_.append_page_raw(hdr, compressed);
-        page_offsets_[page.id] = offset;
-    }
+    storage_.overwrite_page_raw(offset, hdr, compressed);
 
+    page_offsets_[page.id] = offset;
     return offset;
 }
 

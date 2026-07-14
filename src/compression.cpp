@@ -208,6 +208,10 @@ size_t CompressionEngine::max_compressed_size(CompressionType type, size_t src_s
     return src_size;
 }
 
+// Thread-local scratch buffer to avoid repeated allocations during page writes.
+// Each flush_page call compresses into this buffer, which grows as needed.
+static thread_local std::vector<char> tl_compress_scratch;
+
 size_t CompressionEngine::compress(
     CompressionType    type,
     const char*        src,
@@ -219,18 +223,22 @@ size_t CompressionEngine::compress(
         return src_size;
     }
 
-    // LZ4
+    // LZ4: reuse thread-local scratch for the destination buffer
     size_t bound = max_compressed_size(type, src_size);
-    dst.resize(bound);
+    if (tl_compress_scratch.size() < bound)
+        tl_compress_scratch.resize(bound);
+
     int result = LZ4_compress_default(
-        src, dst.data(),
+        src, tl_compress_scratch.data(),
         static_cast<int>(src_size),
         static_cast<int>(bound));
 
     if (result <= 0)
         throw CompressionError("LZ4 compression failed for src_size=" + std::to_string(src_size));
 
+    // Direct memcpy instead of iterator-based assign (avoids iterator overhead)
     dst.resize(static_cast<size_t>(result));
+    std::memcpy(dst.data(), tl_compress_scratch.data(), static_cast<size_t>(result));
     return static_cast<size_t>(result);
 }
 

@@ -1,34 +1,110 @@
 #include "xdl/storage.h"
+#include "xdl/migrate.h"
 #include <cstring>
 #include <stdexcept>
+
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <BaseTsd.h>
+#include <mutex>
+typedef SSIZE_T ssize_t;
+#define xdl_open    _open
+#define xdl_close   _close
+#define xdl_write   _write
+#define xdl_read    _read
+#define xdl_fstat   _fstat
+#define xdl_fsync   _commit
+#define xdl_ftruncate _chsize
+#define xdl_stat    struct _stat
+#define xdl_oflags  O_BINARY
+
+// Windows lacks pread/pwrite.  lseek+read/write is NOT atomic, so we
+// serialise around a per-fd offset with a mutex to stay thread-safe.
+static std::mutex pread_pwrite_mtx;
+static ssize_t xdl_pread_compat(int fd, void* buf, size_t count, uint64_t offset) {
+    std::lock_guard<std::mutex> lk(pread_pwrite_mtx);
+    _lseek(fd, static_cast<long>(offset), SEEK_SET);
+    return _read(fd, buf, static_cast<unsigned int>(count));
+}
+static ssize_t xdl_pwrite_compat(int fd, const void* buf, size_t count, uint64_t offset) {
+    std::lock_guard<std::mutex> lk(pread_pwrite_mtx);
+    _lseek(fd, static_cast<long>(offset), SEEK_SET);
+    return _write(fd, buf, static_cast<unsigned int>(count));
+}
+#define xdl_pread   xdl_pread_compat
+#define xdl_pwrite  xdl_pwrite_compat
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#define xdl_open    ::open
+#define xdl_close   ::close
+#define xdl_write   ::write
+#define xdl_read    ::read
+#define xdl_fstat   ::fstat
+#define xdl_fsync   ::fsync
+#define xdl_ftruncate ::ftruncate
+#define xdl_stat    struct stat
+#define xdl_oflags  (0)
+#define xdl_pread   ::pread
+#define xdl_pwrite  ::pwrite
+#endif
 
 namespace xdl {
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 // Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 
+#ifdef _WIN32
+static bool file_exists(const std::string& path) {
+    struct _stat st{};
+    return ::_stat(path.c_str(), &st) == 0;
+}
+#else
 static bool file_exists(const std::string& path) {
     struct stat st{};
     return ::stat(path.c_str(), &st) == 0;
 }
+#endif
 
 template<typename T>
-static void write_pod(std::fstream& f, const T& v) {
-    if (!f.write(reinterpret_cast<const char*>(&v), sizeof(T)))
+static void write_pod(int fd, const T& v) {
+    if (xdl_write(fd, reinterpret_cast<const char*>(&v), sizeof(T)) != sizeof(T))
         throw IOError("Write failed");
 }
 
 template<typename T>
-static void read_pod(std::fstream& f, T& v) {
-    if (!f.read(reinterpret_cast<char*>(&v), sizeof(T)))
+static void read_pod(int fd, T& v) {
+    if (xdl_read(fd, reinterpret_cast<char*>(&v), sizeof(T)) != sizeof(T))
         throw IOError("Read failed");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+static void safe_pread(int fd, void* buf, size_t count, uint64_t offset) {
+    size_t done = 0;
+    while (done < count) {
+        ssize_t n = xdl_pread(fd, reinterpret_cast<char*>(buf) + done, count - done,
+                              static_cast<off_t>(offset + done));
+        if (n <= 0) throw IOError("pread failed at offset " + std::to_string(offset + done));
+        done += static_cast<size_t>(n);
+    }
+}
+
+static void safe_pwrite(int fd, const void* buf, size_t count, uint64_t offset) {
+    size_t done = 0;
+    while (done < count) {
+        ssize_t n = xdl_pwrite(fd, reinterpret_cast<const char*>(buf) + done, count - done,
+                               static_cast<off_t>(offset + done));
+        if (n <= 0) throw IOError("pwrite failed at offset " + std::to_string(offset + done));
+        done += static_cast<size_t>(n);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StorageEngine
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 
 StorageEngine::StorageEngine(const std::string& path, CompressionType compression)
     : path_(path), compression_(compression) {}
@@ -43,11 +119,10 @@ void StorageEngine::open() {
     bool exists = file_exists(path_);
 
     if (exists) {
-        file_.open(path_, std::ios::binary | std::ios::in | std::ios::out);
+        fd_ = xdl_open(path_.c_str(), O_RDWR | xdl_oflags, 0644);
     } else {
-        // Create new file
-        file_.open(path_, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
-        if (!file_) throw IOError("Cannot create database file: " + path_);
+        fd_ = xdl_open(path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | xdl_oflags, 0644);
+        if (fd_ < 0) throw IOError("Cannot create database file: " + path_);
 
         DBHeader hdr{};
         hdr.magic       = XDL_MAGIC;
@@ -58,77 +133,104 @@ void StorageEngine::open() {
         write_db_header(hdr);
     }
 
-    if (!file_) throw IOError("Cannot open database file: " + path_);
+    if (fd_ < 0) throw IOError("Cannot open database file: " + path_);
     open_ = true;
 }
 
 void StorageEngine::close() {
     if (!open_) return;
-    file_.flush();
-    file_.close();
+    if (fd_ >= 0) {
+        xdl_fsync(fd_);
+        xdl_close(fd_);
+        fd_ = -1;
+    }
     open_ = false;
 }
 
 bool StorageEngine::is_open() const { return open_; }
 
 DBHeader StorageEngine::read_db_header() {
-    file_.seekg(0);
     DBHeader hdr{};
-    read_pod(file_, hdr);
-    if (hdr.magic != XDL_MAGIC)
+    safe_pread(fd_, &hdr, sizeof(DBHeader), 0);
+    if (hdr.magic != XDL_MAGIC) {
         throw CorruptionError("Invalid database magic: " + path_);
-    if (hdr.version != XDL_VERSION)
-        throw CorruptionError("Unsupported DB version: " + std::to_string(hdr.version));
+    }
     return hdr;
 }
 
 void StorageEngine::write_db_header(const DBHeader& hdr) {
-    file_.seekp(0);
-    write_pod(file_, hdr);
-    file_.flush();
+    safe_pwrite(fd_, &hdr, sizeof(DBHeader), 0);
+    xdl_fsync(fd_);
 }
 
-void StorageEngine::read_page_raw(uint64_t offset, PageHeader& header, std::vector<char>& blob) {
-    file_.seekg(static_cast<std::streamoff>(offset));
-    if (!file_) throw IOError("Seek failed at offset " + std::to_string(offset));
-
-    read_pod(file_, header);
+void StorageEngine::read_page_raw(uint64_t offset, PageHeader& header,
+                                  std::vector<char>& blob) {
+    safe_pread(fd_, &header, sizeof(PageHeader), offset);
 
     blob.resize(header.compressed_size);
-    if (!file_.read(blob.data(), static_cast<std::streamsize>(header.compressed_size)))
-        throw IOError("Failed to read page blob");
+    safe_pread(fd_, blob.data(), header.compressed_size, offset + sizeof(PageHeader));
 }
 
-uint64_t StorageEngine::append_page_raw(const PageHeader& header, const std::vector<char>& blob) {
-    file_.seekp(0, std::ios::end);
-    uint64_t offset = static_cast<uint64_t>(file_.tellp());
+uint64_t StorageEngine::append_page_raw(const PageHeader& header,
+                                         const std::vector<char>& blob) {
+    uint64_t offset = file_size();
 
-    write_pod(file_, header);
-    if (!file_.write(blob.data(), static_cast<std::streamsize>(blob.size())))
-        throw IOError("Failed to write page blob");
-    file_.flush();
+    // Write header + blob in a single pwritev if possible, or just two pwrites
+    safe_pwrite(fd_, &header, sizeof(PageHeader), offset);
+    safe_pwrite(fd_, blob.data(), blob.size(), offset + sizeof(PageHeader));
     return offset;
 }
 
-void StorageEngine::overwrite_page_raw(
-    uint64_t offset, const PageHeader& header, const std::vector<char>& blob)
-{
-    file_.seekp(static_cast<std::streamoff>(offset));
-    if (!file_) throw IOError("Seek failed for overwrite at offset " + std::to_string(offset));
-
-    write_pod(file_, header);
-    if (!file_.write(blob.data(), static_cast<std::streamsize>(blob.size())))
-        throw IOError("Failed to overwrite page blob");
-    file_.flush();
+void StorageEngine::overwrite_page_raw(uint64_t offset,
+                                        const PageHeader& header,
+                                        const std::vector<char>& blob) {
+    uint64_t needed = offset + sizeof(PageHeader) + blob.size();
+    uint64_t cur_sz = file_size();
+    if (needed > cur_sz) {
+        if (xdl_ftruncate(fd_, static_cast<off_t>(needed)) != 0)
+            throw IOError("ftruncate failed");
+    }
+    safe_pwrite(fd_, &header, sizeof(PageHeader), offset);
+    safe_pwrite(fd_, blob.data(), blob.size(), offset + sizeof(PageHeader));
 }
 
 uint64_t StorageEngine::file_size() const {
-    auto& mf = const_cast<std::fstream&>(file_);
-    auto cur = mf.tellg();
-    mf.seekg(0, std::ios::end);
-    auto sz = static_cast<uint64_t>(mf.tellg());
-    mf.seekg(cur);
-    return sz;
+    xdl_stat st{};
+    if (xdl_fstat(fd_, &st) != 0)
+        throw IOError("Cannot stat database file: " + path_);
+    return static_cast<uint64_t>(st.st_size);
 }
 
-} // namespace xdl
+// ---------------------------------------------------------------------------
+// Schema storage
+// ---------------------------------------------------------------------------
+
+void StorageEngine::write_schema(const Schema& schema) {
+    auto data = serialise_schema(schema);
+    uint32_t len = static_cast<uint32_t>(data.size());
+    safe_pwrite(fd_, &len, 4, sizeof(DBHeader));
+    if (!data.empty()) {
+        safe_pwrite(fd_, data.data(), data.size(), sizeof(DBHeader) + 4);
+    }
+}
+
+Schema StorageEngine::read_schema() {
+    uint32_t len = 0;
+    safe_pread(fd_, &len, 4, sizeof(DBHeader));
+    if (len == 0 || len > 65536) {
+        throw CorruptionError("No schema stored in DB file (legacy format)");
+    }
+    std::vector<char> data(len);
+    safe_pread(fd_, data.data(), len, sizeof(DBHeader) + 4);
+    return deserialise_schema(data.data(), data.size());
+}
+
+uint64_t StorageEngine::data_start_offset() const {
+    uint32_t schema_len = 0;
+    if (xdl_pread(fd_, &schema_len, 4, sizeof(DBHeader)) != 4)
+        return sizeof(DBHeader);
+    if (schema_len > 65536) return sizeof(DBHeader);
+    return static_cast<uint64_t>(sizeof(DBHeader)) + 4 + schema_len;
+}
+
+}  // namespace xdl

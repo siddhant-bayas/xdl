@@ -12,4 +12,8 @@
 #include "xdl/cache.h"
 #include "xdl/index.h"
 #include "xdl/pager.h"
+#include "xdl/wal.h"
+#include "xdl/bptree.h"
+#include "xdl/migrate.h"
+#include "xdl/mmap.h"
 #include "xdl/db.h"
