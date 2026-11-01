@@ -242,6 +242,7 @@ Sample run (`Release`, 10,000 rows, 2-field schema, LZ4, local SSD):
 |---|---:|
 | Batch insert 10,000 rows | 6.2 ms |
 | Insert 10,000 rows one-by-one (fsync each) | ~7.9 s |
+| Checkpoint (flush 10,000 rows) | ~6 ms |
 | Random point lookup ×10,000 | 1.3 ms (~0.13 µs/get) |
 | Full scan 10,000 rows | 0.16 ms |
 | Verify all rows after reopen | 1.1 ms |

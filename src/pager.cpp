@@ -152,11 +152,23 @@ void Pager::flush_all() {
         if (p.dirty) dirty_pages.push_back(p.id);
     });
 
+    // Page slots are fixed-size, so writing in page order turns the
+    // checkpoint into a sequential pass over the file instead of random
+    // writes in hash-map order.
+    std::sort(dirty_pages.begin(), dirty_pages.end());
+
     for (uint32_t pid : dirty_pages) {
         Page* p = cache_.get_mut(pid);
         if (!p || !p->dirty) continue;
+
+        auto it = page_offsets_.find(pid);
+        uint64_t old_offset = (it == page_offsets_.end()) ? UINT64_MAX : it->second;
         uint64_t new_offset = write_page_to_disk(*p);
-        index_.update_offsets_for_page(pid, new_offset);
+
+        // A page already on disk keeps its fixed slot offset, so its index
+        // entries are still correct.  Only first-time flushes need repair.
+        if (new_offset != old_offset)
+            index_.update_offsets_for_page(pid, new_offset);
         p->dirty = false;
     }
 

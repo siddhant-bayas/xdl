@@ -237,9 +237,11 @@ void DB::close() {
     if (!open_) return;
     WriteLock lock(rwlock_);
     if (!open_) return;
-    // WAL checkpoint: flush all dirty pages, then clear WAL
+    // Flush all dirty pages, then drop the WAL.  flush_all() fsyncs the DB
+    // header after the page writes, so the data is durable before the WAL is
+    // removed.  A CHECKPOINT record would only add an fsync to a file that is
+    // about to be deleted.
     pager_->flush_all();
-    wal_->log_checkpoint();
     wal_->clear();
     wal_->close();
     storage_->close();
@@ -649,7 +651,6 @@ void DB::checkpoint() {
     WriteLock lock(rwlock_);
     if (!open_) throw XDLError("DB not open");
     pager_->flush_all();
-    wal_->log_checkpoint();
     wal_->clear();
 }
 

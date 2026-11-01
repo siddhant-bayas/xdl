@@ -184,14 +184,15 @@ uint64_t StorageEngine::append_page_raw(const PageHeader& header,
 void StorageEngine::overwrite_page_raw(uint64_t offset,
                                         const PageHeader& header,
                                         const std::vector<char>& blob) {
-    uint64_t needed = offset + sizeof(PageHeader) + blob.size();
-    uint64_t cur_sz = file_size();
-    if (needed > cur_sz) {
-        if (xdl_ftruncate(fd_, static_cast<off_t>(needed)) != 0)
-            throw IOError("ftruncate failed");
-    }
-    safe_pwrite(fd_, &header, sizeof(PageHeader), offset);
-    safe_pwrite(fd_, blob.data(), blob.size(), offset + sizeof(PageHeader));
+    // Write header + payload in one syscall instead of two.  pwrite extends
+    // the file when the offset is past the current end, so no ftruncate or
+    // per-page fstat is needed.
+    const size_t hdr_sz = sizeof(PageHeader);
+    std::vector<char> buf(hdr_sz + blob.size());
+    std::memcpy(buf.data(), &header, hdr_sz);
+    if (!blob.empty())
+        std::memcpy(buf.data() + hdr_sz, blob.data(), blob.size());
+    safe_pwrite(fd_, buf.data(), buf.size(), offset);
 }
 
 uint64_t StorageEngine::file_size() const {

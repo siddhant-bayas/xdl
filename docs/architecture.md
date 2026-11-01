@@ -123,15 +123,21 @@ DB::scan(visitor, filter)
 DB::checkpoint()
   └─ WriteLock (exclusive)
   └─ Pager::flush_all()
-       for each dirty page in cache:
+       for each dirty page in ascending page order:
          └─ CompressionEngine::compress(page.data)
          └─ StorageEngine::overwrite_page_raw(offset, header, blob)
-            (fixed-offset slot; ftruncate if growing)
+            (fixed-offset slot; header + payload in one pwrite)
          └─ IndexManager::update_offset(all rows on page)
-       └─ StorageEngine::write_db_header(page_count)
-  └─ WAL::log_checkpoint()
-  └─ WAL::clear()               ← destroy and recreate WAL file
+            (only when the page was not already on disk)
+       └─ StorageEngine::write_db_header(page_count) + fsync
+  └─ WAL::clear()               ← unlink and recreate WAL file
 ```
+
+`flush_all()` fsyncs the database header after all page writes, so the data
+file is durable before the WAL is removed.  No CHECKPOINT record is needed:
+it would only add an fsync to a file that is deleted immediately afterwards.
+`WAL::log_checkpoint()` remains available for callers that want an explicit
+durable marker without clearing the log.
 
 ### Crash Recovery (on open)
 
@@ -346,7 +352,7 @@ The WAL uses POSIX fd-based I/O (not `std::fstream`) for reliable `fsync`, with 
 - **log_delete()** — writes DELETE record (row id + page/slot metadata)
 - **sync()** — flush buffered records and fsync once; used after a batch logged with `sync_now = false`
 - **log_commit()** — writes COMMIT marker
-- **log_checkpoint()** — writes CHECKPOINT marker + fsync
+- **log_checkpoint()** — writes CHECKPOINT marker + fsync (optional before a clear; `DB::checkpoint()` omits it because the WAL is deleted right after the data file is fsynced)
 - **replay()** — reads all records, validates CRC32, returns vector of WALRecords
 - **clear()** — unlinks and recreates the WAL file
 
