@@ -92,14 +92,12 @@ void Pager::recover() {
 // get_page() — returns a copy, safe for concurrent readers
 // ─────────────────────────────────────────────────────────────────────────────
 
-Page Pager::get_page(uint32_t page_id) {
-    auto cached = cache_.get(page_id);
-    if (cached) return *cached;
+std::shared_ptr<const Page> Pager::get_page(uint32_t page_id) {
+    if (auto cached = cache_.get_shared(page_id)) return cached;
 
-    Page page = load_from_disk(page_id);
-    Page result = page;               // copy before moving into cache
-    cache_.put(std::move(page));
-    return result;
+    // put_shared returns the resident copy; use it instead of the local
+    // pointer so readers and writers observe the same page object.
+    return cache_.put_shared(std::make_shared<Page>(load_from_disk(page_id)));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,9 +109,9 @@ Page& Pager::get_mutable_page(uint32_t page_id) {
     Page* cached = cache_.get_mut(page_id);
     if (cached) return *cached;
 
-    Page page = load_from_disk(page_id);
-    cache_.put(std::move(page));
-    return *cache_.get_mut(page_id);
+    // The cache keeps the page alive; put_shared returns whichever copy is
+    // resident (ours, or one inserted concurrently).
+    return *cache_.put_shared(std::make_shared<Page>(load_from_disk(page_id)));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -122,10 +120,9 @@ Page& Pager::get_mutable_page(uint32_t page_id) {
 
 Page& Pager::new_page() {
     uint32_t pid = next_page_id_++;
-    Page page(pid);
-    page.dirty = true;
-    cache_.put(std::move(page));
-    return *cache_.get_mut(pid);
+    auto page = std::make_shared<Page>(pid);
+    page->dirty = true;
+    return *cache_.put_shared(std::move(page));
 }
 
 void Pager::mark_dirty(uint32_t page_id) {

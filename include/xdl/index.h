@@ -32,14 +32,20 @@ struct IndexEntry {
 class IndexManager {
 public:
     // Insert a new entry.  Throws DuplicateKeyError if id already present.
+    // Duplicate detection covers both the sorted portion and the write
+    // buffer, so it also protects the bulk-load path used by recover().
     void insert(uint32_t id, const IndexEntry& entry) {
+        if (prepared_ && buf_.size() >= MERGE_THRESHOLD) merge();
         if (prepared_) {
-            if (buf_.size() >= MERGE_THRESHOLD) merge();
             auto it = lower_bound(id);
             if (it != entries_.end() && it->id == id)
                 throw DuplicateKeyError("Duplicate key: " + std::to_string(id));
         }
+        if (buf_ids_.find(id) != buf_ids_.end())
+            throw DuplicateKeyError("Duplicate key: " + std::to_string(id));
+
         buf_.push_back({id, entry});
+        buf_ids_.insert(id);
         page_to_ids_[entry.page_id].insert(id);
     }
 
@@ -50,6 +56,9 @@ public:
             if (it != entries_.end() && it->id == id)
                 return &it->entry;
         }
+        // Most lookups miss the small write buffer; the hash set makes that
+        // check O(1) instead of a linear scan.
+        if (buf_ids_.find(id) == buf_ids_.end()) return nullptr;
         for (auto& p : buf_) {
             if (p.id == id) return &p.entry;
         }
@@ -69,6 +78,7 @@ public:
         for (auto it = buf_.begin(); it != buf_.end(); ++it) {
             if (it->id == id) {
                 page_to_ids_[it->entry.page_id].erase(id);
+                buf_ids_.erase(id);
                 buf_.erase(it);
                 return true;
             }
@@ -100,6 +110,27 @@ public:
         }
     }
 
+    // Update the row slot for a key (used after compacting a page).
+    void update_slot(uint32_t id, uint32_t new_slot) {
+        if (prepared_) {
+            auto it = lower_bound(id);
+            if (it != entries_.end() && it->id == id) {
+                it->entry.row_slot = new_slot;
+                return;
+            }
+        }
+        for (auto& p : buf_) {
+            if (p.id == id) { p.entry.row_slot = new_slot; return; }
+        }
+    }
+
+    // Row ids currently located on a page, or nullptr if none are indexed.
+    // Used to repair slots after a page compaction.
+    const std::unordered_set<uint32_t>* ids_for_page(uint32_t page_id) const {
+        auto it = page_to_ids_.find(page_id);
+        return it == page_to_ids_.end() ? nullptr : &it->second;
+    }
+
     bool     empty() const { return entries_.empty() && buf_.empty(); }
     size_t   size()  const { return entries_.size() + buf_.size(); }
 
@@ -125,6 +156,7 @@ private:
 
     std::vector<Pair> entries_;
     std::vector<Pair> buf_;
+    std::unordered_set<uint32_t> buf_ids_;  // O(1) duplicate/miss checks
     static constexpr size_t MERGE_THRESHOLD = 1024;
     bool prepared_ = false;
 
@@ -150,6 +182,7 @@ private:
                    std::back_inserter(merged));
         entries_ = std::move(merged);
         buf_.clear();
+        buf_ids_.clear();
     }
 };
 

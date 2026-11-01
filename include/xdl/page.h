@@ -74,6 +74,9 @@ struct PageHeader {
 
 static_assert(sizeof(PageHeader) == 20, "PageHeader layout changed");
 
+// Serialised byte length of a row, including the 4-byte length header.
+uint32_t serialised_row_size(const Row& row, const Schema& schema);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // In-memory page  (always holds uncompressed row bytes)
 //
@@ -107,12 +110,23 @@ struct Page {
         data.reserve(PAGE_SIZE);
     }
 
+    // Append a row; caller must check has_capacity() first.
+    void append_row(const Row& row, const Schema& schema);
+
+    // Remove the idx-th row, compacting the page data and shifting later
+    // offsets down.  The caller is responsible for updating the primary
+    // index entries whose row_slot changes.
+    void erase_row(uint32_t idx);
+
+    // Row id stored at the given slot (O(1), no full row decode).
+    uint32_t row_id_at(uint32_t idx) const {
+        return serialise::read_u32(data.data() + row_offsets[idx] + 4);
+    }
+
+    // True if another row may still be appended (row-count limit only).
     bool has_capacity() const {
         return row_count < MAX_ROWS_PER_PAGE;
     }
-
-    // Append a row; caller must check has_capacity() first.
-    void append_row(const Row& row, const Schema& schema);
 
     // Decode the idx-th row (0-based).
     Row get_row(uint32_t idx, const Schema& schema) const;

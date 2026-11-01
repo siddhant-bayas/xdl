@@ -96,18 +96,19 @@ struct Stats {
 // Secondary indexes: call create_index(field_name) to build a B+ tree index
 // on a field.  Scans on indexed fields use the index for range queries.
 //
-// Schema migrations: if the on-disk schema version differs from the requested
-// schema, a migration is applied (if compatible) during open().
+// Schema handling: on open(), an existing file's stored schema is adopted when
+// no schema is supplied.  An explicit schema must match the stored schema or
+// open() throws MigrationError, so stored rows are never reinterpreted.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class DB {
 public:
     // path        — file path for the database (created if absent)
-    // schema      — field definitions; must not change across open/close
-    //             (unless a migration is provided)
+    // schema      — field definitions; omit to adopt an existing file's schema
     // compression — default compression for new pages
     // cache_cap   — number of pages to keep in the LRU buffer pool
-    // migration   — optional schema migration to apply on version mismatch
+    // migration   — schema migration plan (see SchemaMigrator); open() does not
+    //               rewrite an existing file automatically
     explicit DB(const std::string& path,
                 Schema             schema      = {},
                 CompressionType    compression = CompressionType::LZ4,
@@ -135,10 +136,33 @@ public:
     // Thread-safe: acquires write lock internally.
     void insert(const Row& row);
 
+    // Insert many rows with a single WAL fsync.  All rows are validated
+    // before any is written, so a duplicate or malformed row leaves the
+    // database unchanged.  Returns the number of rows inserted.
+    size_t insert_batch(const std::vector<Row>& rows);
+
     // Convenience builder: constructs a Row from id and ordered field values.
     void insert(uint32_t id, std::vector<FieldValue> field_values) {
         insert(Row{id, std::move(field_values)});
     }
+
+    // Delete a row by primary key.  Throws NotFoundError if absent.
+    // The page is compacted immediately; secondary indexes are updated.
+    void erase(uint32_t id);
+
+    // Delete many rows with a single WAL fsync.  All ids are validated
+    // before any is removed, so an unknown or duplicate id leaves the
+    // database unchanged.  Returns the number of rows deleted.
+    size_t erase_batch(const std::vector<uint32_t>& ids);
+
+    // Replace the row with the same id.  Throws NotFoundError if absent.
+    // The old row is removed and the new one inserted atomically under the
+    // write lock; both primary and secondary indexes are kept consistent.
+    void update(const Row& row);
+
+    // Replace many existing rows with a single WAL fsync.  All rows are
+    // validated before any is written.  Returns the number of rows updated.
+    size_t update_batch(const std::vector<Row>& rows);
 
     // ── Read operations ──────────────────────────────────────────────────────
 
@@ -186,10 +210,21 @@ public:
     Stats stats() const;
 
 private:
-    Page& get_or_create_writable_page();
+    Page& get_or_create_writable_page(const Row& row);
 
-    // Rebuild secondary indexes from disk (called during open).
-    void rebuild_indexes();
+    // Lock-held implementations.  All public write methods take the write
+    // lock once and delegate here, so update() can compose erase + insert
+    // without recursive locking.
+    void insert_unlocked(const Row& row, bool sync_now = true);
+    bool erase_unlocked(uint32_t id);
+    void repair_slots_after_erase(uint32_t page_id);
+
+    // Point lookup without acquiring the lock; callers must hold a read lock.
+    Row get_unlocked(uint32_t id) const;
+
+    // Scan without acquiring the lock; callers must already hold a read lock.
+    void scan_unlocked(std::function<void(const Row&)> visitor,
+                       const ScanFilter& filter) const;
 
     // Apply WAL replay after a crash.
     void replay_wal();
@@ -199,6 +234,7 @@ private:
     CompressionType         compression_;
     size_t                  cache_cap_;
     SchemaMigrate           migration_;
+    bool                    schema_explicit_ = false;
 
     std::unique_ptr<StorageEngine> storage_;
     std::unique_ptr<IndexManager>  index_;

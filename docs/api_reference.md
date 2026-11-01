@@ -187,7 +187,12 @@ explicit DB(const std::string& path,
 | `schema` | `{age:uint32, name:string}` | Field definitions |
 | `compression` | `LZ4` | Compression for new pages |
 | `cache_cap` | `256` | LRU cache size in pages |
-| `migration` | `{}` | Optional schema migration |
+| `migration` | `{}` | Optional schema migration plan (not auto-applied by `open()`) |
+
+If `schema` is omitted, an existing database adopts the schema stored in the
+file. If an explicit schema is supplied and does not match the stored schema
+(field names and types, in order), `open()` throws `MigrationError`. This
+prevents silently reinterpreting existing rows.
 
 ### Lifecycle
 
@@ -200,11 +205,25 @@ bool is_open() const;
 ### Write Operations
 
 ```cpp
-void insert(const Row& row);
-void insert(uint32_t id, std::vector<FieldValue> field_values);
+void   insert(const Row& row);
+void   insert(uint32_t id, std::vector<FieldValue> field_values);
+size_t insert_batch(const std::vector<Row>& rows);
+
+void   erase(uint32_t id);
+size_t erase_batch(const std::vector<uint32_t>& ids);
+
+void   update(const Row& row);
+size_t update_batch(const std::vector<Row>& rows);
 ```
 
-Throws `DuplicateKeyError` on duplicate id. Acquires write lock. Logs to WAL.
+- `insert` throws `DuplicateKeyError` on a duplicate id.
+- `erase` / `update` throw `NotFoundError` when the id is absent.
+- `update` is implemented as delete + insert under one write lock, so it handles
+  rows that grow or shrink and keeps secondary indexes consistent.
+- The `*_batch` variants validate every row/id before writing anything, then
+  issue a single WAL fsync at the end. A bad row leaves the database unchanged.
+  They return the number of rows written/deleted/updated.
+- All writes acquire the exclusive lock and log to the WAL.
 
 ### Read Operations
 
@@ -231,6 +250,10 @@ std::vector<Row> index_range_scan(
     const std::optional<FieldValue>& lo, bool lo_inclusive,
     const std::optional<FieldValue>& hi, bool hi_inclusive) const;
 ```
+
+`index_range_scan` uses the secondary index when one exists and otherwise falls
+back to a full scan with the same ordering semantics (so callers do not need to
+check `has_index()` first).
 
 ### Maintenance
 
@@ -295,17 +318,27 @@ public:
     bool is_open() const;
 
     uint64_t log_insert(uint32_t row_id, uint32_t page_id, uint32_t row_slot,
-                        const char* row_data, uint32_t row_data_len);
+                        const char* row_data, uint32_t row_data_len,
+                        bool sync_now = true);
 
     // Zero-copy variant: writes directly from caller's buffer.
     uint64_t log_insert_direct(uint32_t row_id, uint32_t page_id, uint32_t row_slot,
-                               const char* row_data, uint32_t row_data_len);
+                               const char* row_data, uint32_t row_data_len,
+                               bool sync_now = true);
+
+    // DELETE record: replay removes the row and updates the indexes.
+    uint64_t log_delete(uint32_t row_id, uint32_t page_id, uint32_t row_slot,
+                        bool sync_now = true);
+
+    void sync();            // flush buffered records + fsync once
 
     void log_commit();
     void log_checkpoint();
 
     struct WALRecord {
-        enum Type : uint8_t { INSERT = 0, COMMIT = 1, CHECKPOINT = 2, ROLLBACK = 3 };
+        enum Type : uint8_t {
+            INSERT = 0, COMMIT = 1, CHECKPOINT = 2, ROLLBACK = 3, DELETE = 4
+        };
         Type              type;
         uint32_t          row_id;
         uint32_t          page_id;
@@ -319,7 +352,10 @@ public:
 };
 ```
 
-`log_insert_direct()` is the zero-copy variant used internally by `DB::insert()`. Both methods flush to disk (fsync) before returning.
+`log_insert_direct()` is the zero-copy variant used internally by `DB::insert()`.
+Both insert variants flush to disk (fsync) before returning by default; pass
+`sync_now = false` when logging a batch and call `sync()` once afterwards. This
+is what `DB::insert_batch()`, `DB::erase_batch()` and `DB::update_batch()` do.
 
 ---
 
@@ -342,7 +378,7 @@ public:
 };
 ```
 
-Backed by a flat sorted `std::vector<Entry>` with binary search for O(log n) lookups. Uses `KeyBuffer` (32-byte stack allocation) during traversal to avoid heap allocation.
+Backed by a flat sorted `std::vector<Entry>` with binary search for O(log n) lookups. Keys are encoded in full (no truncation), so long string keys remain distinct and correctly ordered.
 
 ---
 
@@ -356,12 +392,14 @@ public:
     const IndexEntry* find(uint32_t id) const;
 
     void update_offset(uint32_t id, uint64_t new_offset);
+    void update_offsets_for_page(uint32_t page_id, uint64_t new_offset);
+    void update_slot(uint32_t id, uint32_t new_slot);
     size_t size() const;
 
     template<typename Fn> void for_each(Fn&& fn) const;
 
-    // Reverse lookup: all row IDs on a given page
-    const std::vector<uint32_t>* page_row_ids(uint32_t page_id) const;
+    // Reverse lookup: row IDs currently indexed on a page (nullptr if none).
+    const std::unordered_set<uint32_t>* ids_for_page(uint32_t page_id) const;
 };
 ```
 
@@ -376,8 +414,16 @@ public:
 
     explicit PageCache(size_t capacity, EvictionCb on_evict = nullptr);
 
-    Page* get(uint32_t page_id);
+    // Copying accessors (kept for compatibility)
+    std::optional<Page> get(uint32_t page_id);
+    Page*               get_mut(uint32_t page_id);   // exclusive lock only
+
+    // Zero-copy read path: immutable snapshot, safe even if evicted.
+    std::shared_ptr<const Page> get_shared(uint32_t page_id);
+
     void  put(Page page);
+    // Returns the resident page (the argument, or an existing cached copy).
+    std::shared_ptr<Page> put_shared(std::shared_ptr<Page> page);
     void  evict(uint32_t page_id);
     void  flush_all();
 
@@ -389,6 +435,9 @@ public:
 };
 ```
 
+Pages are heap-allocated and shared with readers, so a cache hit does not copy
+up to `PAGE_SIZE` bytes. `put()` replaces the resident pointer instead of
+mutating it in place, so readers holding a snapshot are never raced by a write.
 The eviction callback fires only for dirty pages.
 
 ---
@@ -408,8 +457,12 @@ struct Page {
     explicit Page(uint32_t page_id);
 
     void   append_row(const Row& row, const Schema& schema);
+    void   erase_row(uint32_t idx);
     Row    get_row(uint32_t idx, const Schema& schema) const;
     int    find_row(uint32_t id, const Schema& schema) const;
+
+    // Row id at a slot without decoding the whole row.
+    uint32_t row_id_at(uint32_t idx) const;
 
     std::vector<char> row_data_copy(uint32_t idx, const Schema& schema) const;
 
@@ -417,7 +470,14 @@ struct Page {
     const char* row_data_ptr(uint32_t idx) const;
     uint32_t    row_data_len(uint32_t idx) const;
 };
+
+// Serialised byte length of a row, including the 4-byte length header.
+uint32_t serialised_row_size(const Row& row, const Schema& schema);
 ```
+
+`append_row()` throws `XDLError` if the serialised row exceeds `PAGE_SIZE` or a
+string field exceeds 65535 bytes. `erase_row()` compacts the page and shifts
+later offsets; the caller must repair index slots (see `IndexManager::update_slot`).
 
 ---
 

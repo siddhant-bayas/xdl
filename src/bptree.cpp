@@ -99,7 +99,7 @@ std::vector<char> bptree_key_encode_vec(const FieldValue& fv, FieldType type) {
 
 int bptree_key_compare(const char* a, size_t a_len, const char* b, size_t b_len) {
     size_t min_len = std::min(a_len, b_len);
-    int cmp = std::memcmp(a, b, min_len);
+    int cmp = min_len ? std::memcmp(a, b, min_len) : 0;
     if (cmp != 0) return cmp;
     if (a_len < b_len) return -1;
     if (a_len > b_len) return 1;
@@ -133,7 +133,7 @@ std::vector<BPTree::Entry>::const_iterator BPTree::lower_bound(const char* key, 
 }
 
 void BPTree::insert(const FieldValue& key, FieldType key_type, uint32_t row_id) {
-    KeyBuffer kb = bptree_key_encode(key, key_type);
+    std::vector<char> kb = bptree_key_encode_vec(key, key_type);
     auto it = lower_bound(kb.data(), kb.size());
 
     if (it != entries_.end() &&
@@ -145,14 +145,14 @@ void BPTree::insert(const FieldValue& key, FieldType key_type, uint32_t row_id) 
         }
     } else {
         Entry e;
-        e.key_data.assign(kb.data(), kb.data() + kb.size());
+        e.key_data = std::move(kb);
         e.ids.push_back(row_id);
         entries_.insert(it, std::move(e));
     }
 }
 
 void BPTree::erase(const FieldValue& key, FieldType key_type, uint32_t row_id) {
-    KeyBuffer kb = bptree_key_encode(key, key_type);
+    std::vector<char> kb = bptree_key_encode_vec(key, key_type);
     auto it = lower_bound(kb.data(), kb.size());
     if (it == entries_.end()) return;
     if (bptree_key_compare(it->key_data.data(), it->key_data.size(),
@@ -166,7 +166,7 @@ void BPTree::erase(const FieldValue& key, FieldType key_type, uint32_t row_id) {
 }
 
 const std::vector<uint32_t>* BPTree::find(const FieldValue& key, FieldType key_type) const {
-    KeyBuffer kb = bptree_key_encode(key, key_type);
+    std::vector<char> kb = bptree_key_encode_vec(key, key_type);
     const Entry* e = find_entry(kb.data(), kb.size());
     return e ? &e->ids : nullptr;
 }
@@ -176,9 +176,9 @@ void BPTree::range_scan(
     const std::optional<FieldValue>& hi, FieldType hi_type, bool hi_inclusive,
     std::function<void(const std::vector<char>&, const std::vector<uint32_t>&)> visitor) const
 {
-    KeyBuffer lo_kb, hi_kb;
-    if (lo) lo_kb = bptree_key_encode(*lo, lo_type);
-    if (hi) hi_kb = bptree_key_encode(*hi, hi_type);
+    std::vector<char> lo_kb, hi_kb;
+    if (lo) lo_kb = bptree_key_encode_vec(*lo, lo_type);
+    if (hi) hi_kb = bptree_key_encode_vec(*hi, hi_type);
 
     auto it = entries_.begin();
 

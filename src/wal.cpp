@@ -254,24 +254,38 @@ uint64_t WAL::write_record(WALRecord::Type type,
 // ─────────────────────────────────────────────────────────────────────────────
 
 uint64_t WAL::log_insert(uint32_t row_id, uint32_t page_id, uint32_t row_slot,
-                         const char* row_data, uint32_t row_data_len) {
+                         const char* row_data, uint32_t row_data_len,
+                         bool sync_now) {
     uint64_t offset = write_record(WALRecord::INSERT, row_data, row_data_len,
                                    row_id, page_id, row_slot);
     // Ensure the WAL record is durable before returning to the caller.
     // Without this, a crash between insert and checkpoint loses WAL records.
-    flush_write_buffer();
-    fsync_if_dirty();
+    if (sync_now) sync();
     return offset;
 }
 
 uint64_t WAL::log_insert_direct(uint32_t row_id, uint32_t page_id, uint32_t row_slot,
-                                const char* row_data, uint32_t row_data_len) {
+                                const char* row_data, uint32_t row_data_len,
+                                bool sync_now) {
     // Identical to log_insert but semantically marks the zero-copy path.
     uint64_t offset = write_record(WALRecord::INSERT, row_data, row_data_len,
                                    row_id, page_id, row_slot);
+    if (sync_now) sync();
+    return offset;
+}
+
+uint64_t WAL::log_delete(uint32_t row_id, uint32_t page_id, uint32_t row_slot,
+                         bool sync_now) {
+    uint64_t offset = write_record(WALRecord::DELETE, nullptr, 0,
+                                   row_id, page_id, row_slot);
+    if (sync_now) sync();
+    return offset;
+}
+
+void WAL::sync() {
+    if (!open_) return;
     flush_write_buffer();
     fsync_if_dirty();
-    return offset;
 }
 
 void WAL::log_commit() {
@@ -361,19 +375,15 @@ std::vector<WAL::WALRecord> WAL::replay() {
         WALRecord rec;
         rec.type = static_cast<WALRecord::Type>(type_byte);
 
-        if (type_byte <= 3) {
-            std::memcpy(&rec.row_id,   rest + 1, 4);
-            std::memcpy(&rec.page_id,  rest + 5, 4);
-            std::memcpy(&rec.row_slot, rest + 9, 4);
+        // Parse metadata.  Every record body carries the 12-byte metadata
+        // header, regardless of type.
+        std::memcpy(&rec.row_id,   rest + 1, 4);
+        std::memcpy(&rec.page_id,  rest + 5, 4);
+        std::memcpy(&rec.row_slot, rest + 9, 4);
 
-            if (record_len > 17) {
-                uint32_t dlen = record_len - 17;
-                rec.row_data.assign(rest + 13, rest + 13 + dlen);
-            }
-        } else {
-            rec.row_id = 0;
-            rec.page_id = 0;
-            rec.row_slot = 0;
+        if (record_len > 17) {
+            uint32_t dlen = record_len - 17;
+            rec.row_data.assign(rest + 13, rest + 13 + dlen);
         }
 
         records.push_back(std::move(rec));

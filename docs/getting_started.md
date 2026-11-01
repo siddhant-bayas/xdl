@@ -30,7 +30,7 @@ cmake --build . -j$(nproc)
 This produces:
 
 - `build/xdl` — interactive CLI
-- `build/xdl_tests` — test suite (139 tests)
+- `build/xdl_tests` — test suite (175 tests)
 - `build/libxdl_core.a` — static library to link against
 
 ### Windows (MSVC)
@@ -58,7 +58,7 @@ Produces `xdl.exe`, `xdl_tests.exe`, `xdl_core.lib`.
 
 ```bash
 ./xdl_tests
-# Expected: Passed: 139/139
+# Expected: Passed: 175/175
 ```
 
 ### Without CMake
@@ -88,6 +88,8 @@ The `xdl` binary opens (or creates) a database file and accepts commands interac
 | Command | Description |
 |---------|-------------|
 | `insert <id> <v1> [<v2> ...]` | Insert a row (values in schema order) |
+| `update <id> <v1> [<v2> ...]` | Replace an existing row |
+| `delete <id>` / `erase <id>` | Delete a row by primary key |
 | `get <id>` | Retrieve a row by primary key |
 | `scan [--<field> <val>] [--min-<field> N] [--max-<field> N] [--prefix-<field> STR]` | Scan with optional filters |
 | `index <field_name>` | Create a B+ tree secondary index on a field |
@@ -127,11 +129,17 @@ xdl> scan --min-age 25 --max-score 90.0
 id=     2  age=    30  name=bob         score=   87.20
 1 row(s)
 
+xdl> update 2 31 bob 88.0
+Updated id=2
+
+xdl> delete 3
+Deleted id=3
+
 xdl> index age
 Index created on 'age'
 
 xdl> stats
-rows          : 3
+rows          : 2
 pages         : 1
 cache capacity: 256 pages
 file size     : 8277 bytes
@@ -175,6 +183,10 @@ xdl::DB db("path/to/mydb.xdl", schema);
 db.open();
 ```
 
+If you omit the schema, an existing database adopts the schema stored in the
+file. Supplying a schema that does not match the stored one throws
+`xdl::MigrationError` instead of silently reinterpreting rows.
+
 ### Step 3: Insert rows
 
 ```cpp
@@ -191,6 +203,28 @@ db.insert(2, {xdl::FieldValue{uint32_t(30)},
               xdl::FieldValue{std::string("bob")},
               xdl::FieldValue{87.2f},
               xdl::FieldValue{false}});
+
+// Bulk insert: validate all rows, then one WAL fsync
+std::vector<xdl::Row> batch;
+for (uint32_t i = 10; i < 1000; ++i) {
+    batch.push_back(xdl::Row{i, {
+        xdl::FieldValue{i},
+        xdl::FieldValue{"user_" + std::to_string(i)},
+        xdl::FieldValue{1.0f},
+        xdl::FieldValue{true},
+    }});
+}
+db.insert_batch(batch);
+
+// Update and delete
+db.update(xdl::Row{1, {xdl::FieldValue{uint32_t(26)},
+                       xdl::FieldValue{std::string("alice")},
+                       xdl::FieldValue{95.5f},
+                       xdl::FieldValue{true}}});
+db.erase(2);
+
+// Or delete many rows with a single fsync
+db.erase_batch({10, 11, 12});
 ```
 
 ### Step 4: Look up a row

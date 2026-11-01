@@ -59,15 +59,33 @@ XDL is a layered, embedded storage engine built around these core ideas:
 ```
 DB::insert(row)
   └─ WriteLock (exclusive)
-  └─ WAL::log_insert(row.id, page_id, slot, row_data)   ← fsync
   └─ IndexManager::find(id)           ← guard: reject duplicates
   └─ DB::get_or_create_writable_page()
-       └─ Pager::get_page(last_pid)   ← cache hit → return
-          or Pager::new_page()         ← allocate fresh slot
+       └─ Pager::get_mutable_page(last_pid)  ← cache hit → return
+          or Pager::new_page()               ← allocate fresh slot
   └─ Page::append_row(row)             ← serialise into page.data
+  └─ WAL::log_insert_direct(...)       ← fsync (unless batching)
   └─ IndexManager::insert(id, {page_id, offset, slot})
-  └─ WAL::log_commit()                ← fsync
   └─ BPTree::insert() for each secondary index
+```
+
+`DB::insert_batch()` runs the same path with `sync_now = false` and calls
+`WAL::sync()` once after the whole batch.
+
+### Update / Delete
+
+```
+DB::update(row)                       DB::erase(id)
+  └─ WriteLock                          └─ WriteLock
+  └─ validate replacement               └─ locate entry
+  └─ erase_unlocked(id)                 └─ WAL::log_delete(...)
+       └─ WAL::log_delete(...)          └─ Page::erase_row(slot)
+       └─ Page::erase_row(slot)         └─ IndexManager::remove(id)
+       └─ IndexManager::remove(id)      └─ repair slots of later rows
+       └─ repair later row slots        └─ BPTree::erase() per index
+       └─ BPTree::erase() per index     └─ WAL::sync()
+  └─ insert_unlocked(row)               (batch variant: one sync total)
+  └─ WAL::sync()
 ```
 
 ### Get
@@ -76,13 +94,16 @@ DB::insert(row)
 DB::get(id)
   └─ ReadLock (shared)
   └─ IndexManager::find(id)   → IndexEntry{page_id, offset, slot}
-  └─ Pager::get_page(page_id)
-       └─ PageCache::get(page_id)  → Page* (cache hit)
+  └─ Pager::get_page(page_id) → shared_ptr<const Page>
+       └─ PageCache::get_shared(page_id)  → snapshot (no copy)
           or StorageEngine::read_page_raw(offset)
              → CompressionEngine::decompress(blob)
-             → PageCache::put(page)
+             → PageCache::put_shared(page)
   └─ Page::get_row(slot)
 ```
+
+Readers hold a shared page snapshot, so an eviction or replacement cannot
+invalidate it and a cache hit copies no page bytes.
 
 ### Scan (zero-copy filter)
 
@@ -117,7 +138,11 @@ DB::checkpoint()
 ```
 DB::open()
   └─ StorageEngine::open()
-  └─ StorageEngine::write_schema(schema)   ← persist schema
+  └─ read on-disk schema
+       ├─ stored schema present and caller passed none  → adopt it
+       ├─ stored schema present and caller passed one   → must match, else MigrationError
+       └─ no stored schema                              → write caller schema
+                                                          (refuse if pages already exist)
   └─ WAL::open()
   └─ Pager::recover()
        for pid in [0, page_count):
@@ -128,6 +153,9 @@ DB::open()
          └─ skip if row already exists (idempotent)
          └─ reconstruct row from serialised data
          └─ insert into page + index + secondary indexes
+       for each DELETE record:
+         └─ locate row, compact its page in memory, mark dirty
+         └─ remove from the primary index
 ```
 
 ---
@@ -193,9 +221,10 @@ Offset 32      ┌────────────────────�
                 │    1=COMMIT          │
                 │    2=CHECKPOINT      │
                 │    3=ROLLBACK        │
-                │  row_id: 4 bytes    │  (INSERT only)
-                │  page_id: 4 bytes   │  (INSERT only)
-                │  row_slot: 4 bytes  │  (INSERT only)
+                │    4=DELETE          │
+                │  row_id: 4 bytes    │  (all records)
+                │  page_id: 4 bytes   │  (all records)
+                │  row_slot: 4 bytes  │  (all records)
                 │  row_data: N bytes  │  (INSERT only)
                 └─────────────────────┘
                 [more records...]
@@ -270,17 +299,27 @@ Key encoding is order-preserving:
 - BOOL: 0x00 or 0x01
 - STRING: raw UTF-8 bytes (lexicographic)
 
-A `KeyBuffer` (32-byte stack-allocated `std::array`) is used to avoid heap allocation during tree traversal.
+Keys are encoded in full (no fixed-width truncation), so long strings remain
+distinct and correctly ordered. A small stack `KeyBuffer` helper still exists for
+callers that want a fixed 32-byte encoding.
 
 ---
 
 ## Cache (Buffer Pool)
 
-`PageCache` is an LRU with `std::list<Page>` + `std::unordered_map<uint32_t, iterator>`. All methods are protected by `std::mutex` for thread safety.
+`PageCache` is an LRU with `std::list<std::shared_ptr<Page>>` +
+`std::unordered_map<uint32_t, iterator>`. All methods are protected by
+`std::mutex` for thread safety.
 
 - **Get**: O(1) lookup, splice to front.
-- **Put**: O(1) insert at front; evict from back if over capacity. Copies `row_offsets` when updating an existing page.
-- **Eviction callback**: before a dirty page leaves the cache, the Pager's `on_cache_evict` lambda compresses and writes it to disk.
+- **get_shared()**: returns an immutable `shared_ptr<const Page>` snapshot. A
+  cache hit copies no page bytes, and the page stays alive even if it is evicted
+  while the reader holds it.
+- **put()**: O(1) insert at front; evict from back if over capacity. Replacing a
+  resident page swaps the pointer instead of mutating it, so concurrent readers
+  never observe a half-written page.
+- **Eviction callback**: before a dirty page leaves the cache, the Pager's
+  `on_cache_evict` lambda compresses and writes it to disk.
 
 The cache is self-flushing — explicit `checkpoint()` is optional but provides a stronger durability guarantee.
 
@@ -302,8 +341,10 @@ The compression boundary is only at the storage layer. The Pager, Cache, and DB 
 
 The WAL uses POSIX fd-based I/O (not `std::fstream`) for reliable `fsync`, with a full Windows portability layer (`_open`/`_write`/`_commit`, `O_BINARY` flag):
 
-- **log_insert()** — writes INSERT record with CRC32, then `flush` + `fsync`
+- **log_insert()** — writes INSERT record with CRC32, then `flush` + `fsync` by default
 - **log_insert_direct()** — zero-copy variant: takes raw serialised row bytes directly
+- **log_delete()** — writes DELETE record (row id + page/slot metadata)
+- **sync()** — flush buffered records and fsync once; used after a batch logged with `sync_now = false`
 - **log_commit()** — writes COMMIT marker
 - **log_checkpoint()** — writes CHECKPOINT marker + fsync
 - **replay()** — reads all records, validates CRC32, returns vector of WALRecords
@@ -311,7 +352,7 @@ The WAL uses POSIX fd-based I/O (not `std::fstream`) for reliable `fsync`, with 
 
 Buffered writes: records are accumulated in a 256 KB write buffer and flushed as a batch. On Windows, `pread`/`pwrite` are emulated with `lseek` + `read`/`write` protected by a `std::mutex`.
 
-On `DB::open()`, after the pager recovers pages from the main DB file, any pending WAL records are replayed to recover uncommitted insertions from a crash.
+On `DB::open()`, after the pager recovers pages from the main DB file, any pending WAL records are replayed to recover uncommitted inserts and deletes from a crash.
 
 ---
 
@@ -319,8 +360,9 @@ On `DB::open()`, after the pager recovers pages from the main DB file, any pendi
 
 `DB` uses a reader-writer lock (`std::shared_mutex` wrapper):
 
-- `get()`, `scan()`, `stats()` → `ReadLock` (shared) — multiple concurrent readers
-- `insert()`, `checkpoint()`, `create_index()`, `drop_index()` → `WriteLock` (exclusive)
+- `get()`, `scan()`, `stats()`, `index_range_scan()` → `ReadLock` (shared) — multiple concurrent readers
+- `insert()`, `insert_batch()`, `erase()`, `erase_batch()`, `update()`,
+  `update_batch()`, `checkpoint()`, `create_index()`, `drop_index()` → `WriteLock` (exclusive)
 
 The WAL file handle is held by the DB and shared with the Pager. WAL writes are serialized by the DB's write lock. The `PageCache` uses its own `std::mutex` for thread-safe access.
 
@@ -342,9 +384,17 @@ std::runtime_error
 
 ---
 
-## Schema Migration
+## Schema Handling and Migration
 
-Schemas are versioned. On `open()`, if the on-disk schema version differs from the requested schema, a migration is applied:
+If the caller does not pass a schema, `open()` adopts the schema stored in the
+file. If a schema is passed and its fields (names and types, in order) differ
+from the stored schema, `open()` throws `MigrationError` before touching any
+data. If the file has pages but no readable schema, it is treated as corrupt and
+left untouched.
+
+`SchemaMigrator` provides row-level helpers for applying a `SchemaMigrate` plan.
+XDL does not rewrite an existing file automatically: create a new database,
+stream migrated rows into it, then swap the files.
 
 ```cpp
 xdl::SchemaMigrate migration;

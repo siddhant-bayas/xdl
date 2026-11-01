@@ -2072,6 +2072,823 @@ void test_scan_filter_matches_string_eq() {
 }
 
 // ---------------------------------------------------------------------------
+// STRESS TESTS
+// ---------------------------------------------------------------------------
+
+// Deterministic LCG — reproducible pseudo-random data without <random> cost.
+struct LCG {
+    uint32_t state = 0x12345678u;
+    uint32_t next() {
+        state = state * 1664525u + 1013904223u;
+        return state;
+    }
+    uint32_t range(uint32_t lo, uint32_t hi) {
+        if (hi <= lo) return lo;
+        return lo + (next() % (hi - lo + 1));
+    }
+};
+
+void test_stress_bulk_insert_get() {
+    cleanup();
+    constexpr int N = 10000;
+    xdl::DB db(test_db_path(), default_schema(), xdl::CompressionType::LZ4, 8);
+    db.open();
+    LCG rng;
+    for (int i = 0; i < N; ++i)
+        db.insert(make_row(static_cast<uint32_t>(i),
+                           rng.range(0, 10000), "user_" + std::to_string(i)));
+    db.checkpoint();
+    for (int i = 0; i < N; ++i) {
+        xdl::Row r = db.get(static_cast<uint32_t>(i));
+        ASSERT_EQ(r.id, static_cast<uint32_t>(i));
+    }
+    auto all = db.scan_all();
+    ASSERT_EQ(all.size(), (size_t)N);
+    auto s = db.stats();
+    ASSERT_EQ(s.row_count, (size_t)N);
+    db.close();
+}
+
+void test_stress_randomized_roundtrip() {
+    cleanup();
+    constexpr int N = 5000;
+    {
+        xdl::DB db(test_db_path(), default_schema(), xdl::CompressionType::LZ4, 64);
+        db.open();
+        LCG rng;
+        for (int i = 0; i < N; ++i) {
+            uint32_t age = rng.range(0, 120);
+            std::string name = "p_" + std::to_string(rng.next());
+            db.insert(xdl::Row{static_cast<uint32_t>(i),
+                               {xdl::FieldValue{age}, xdl::FieldValue{name}}});
+        }
+        db.close();
+    }
+    {
+        xdl::DB db(test_db_path(), default_schema(), xdl::CompressionType::LZ4, 64);
+        db.open();
+        LCG rng;
+        for (int i = 0; i < N; ++i) {
+            uint32_t age = rng.range(0, 120);
+            std::string name = "p_" + std::to_string(rng.next());
+            xdl::Row r = db.get(static_cast<uint32_t>(i));
+            ASSERT_EQ(r.id, static_cast<uint32_t>(i));
+            ASSERT_EQ(r.get_uint32(db.schema(), "age"), age);
+            ASSERT_EQ(r.get_string(db.schema(), "name"), name);
+        }
+        db.close();
+    }
+}
+
+void test_stress_concurrent_writers() {
+    cleanup();
+    constexpr int THREADS = 4;
+    constexpr int PER     = 2500;
+    xdl::DB db(test_db_path(), default_schema(), xdl::CompressionType::LZ4, 64);
+    db.open();
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < THREADS; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int i = 0; i < PER; ++i) {
+                uint32_t id = static_cast<uint32_t>(t * PER + i);
+                try {
+                    db.insert(make_row(id, id % 100, "w" + std::to_string(id)));
+                } catch (...) {
+                    failures++;
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    ASSERT_EQ(failures.load(), 0);
+    auto s = db.stats();
+    ASSERT_EQ(s.row_count, (size_t)(THREADS * PER));
+    for (int t = 0; t < THREADS; ++t) {
+        for (int i = 0; i < PER; ++i) {
+            uint32_t id = static_cast<uint32_t>(t * PER + i);
+            xdl::Row r = db.get(id);
+            ASSERT_EQ(r.id, id);
+            ASSERT_EQ(r.get_uint32(db.schema(), "age"), id % 100);
+        }
+    }
+    db.close();
+}
+
+void test_stress_concurrent_mixed() {
+    cleanup();
+    constexpr int WRITERS = 2;
+    constexpr int READERS = 4;
+    constexpr int PER     = 2000;
+    xdl::DB db(test_db_path(), default_schema(), xdl::CompressionType::LZ4, 64);
+    db.open();
+    std::atomic<int> reads_ok{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < WRITERS; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int i = 0; i < PER; ++i) {
+                uint32_t id = static_cast<uint32_t>(t * PER + i);
+                try {
+                    db.insert(make_row(id, id % 50, "m" + std::to_string(id)));
+                } catch (...) {}
+            }
+        });
+    }
+    for (int t = 0; t < READERS; ++t) {
+        threads.emplace_back([&]() {
+            for (int round = 0; round < 200; ++round) {
+                auto rows = db.scan_all();
+                for (const auto& r : rows) {
+                    uint32_t age = r.get_uint32(db.schema(), "age");
+                    if (age < 50) reads_ok++;
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    auto s = db.stats();
+    ASSERT_EQ(s.row_count, (size_t)(WRITERS * PER));
+    ASSERT(reads_ok.load() > 0);
+    db.close();
+}
+
+void test_stress_checkpoint_cycles() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema(), xdl::CompressionType::LZ4, 16);
+    db.open();
+    constexpr int CYCLES = 40;
+    constexpr int PER    = 50;
+    for (int c = 0; c < CYCLES; ++c) {
+        for (int i = 0; i < PER; ++i) {
+            uint32_t id = static_cast<uint32_t>(c * PER + i);
+            db.insert(make_row(id, id, "cycle_" + std::to_string(id)));
+        }
+        db.checkpoint();
+    }
+    auto s = db.stats();
+    ASSERT_EQ(s.row_count, (size_t)(CYCLES * PER));
+    for (int i = 0; i < CYCLES * PER; ++i) {
+        xdl::Row r = db.get(static_cast<uint32_t>(i));
+        ASSERT_EQ(r.id, static_cast<uint32_t>(i));
+    }
+    db.close();
+}
+
+void test_stress_large_strings() {
+    cleanup();
+    constexpr int N = 400;
+    const std::string big(8000, 'S');
+    xdl::DB db(test_db_path(), default_schema(), xdl::CompressionType::LZ4, 4);
+    db.open();
+    for (int i = 0; i < N; ++i)
+        db.insert(make_row(static_cast<uint32_t>(i), i % 100, big));
+    db.checkpoint();
+    for (int i = 0; i < N; ++i) {
+        xdl::Row r = db.get(static_cast<uint32_t>(i));
+        ASSERT_EQ(r.get_string(db.schema(), "name"), big);
+    }
+    db.close();
+    db.open();
+    xdl::Row r = db.get(static_cast<uint32_t>(N - 1));
+    ASSERT_EQ(r.get_string(db.schema(), "name"), big);
+    db.close();
+}
+
+void test_row_too_large_throws() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema(), xdl::CompressionType::LZ4, 4);
+    db.open();
+    std::string huge(70000, 'H');
+    ASSERT_THROWS(db.insert(make_row(1, 1, huge)), xdl::XDLError);
+    xdl::Row out;
+    ASSERT(!db.try_get(1, out));
+    db.close();
+}
+
+void test_stress_secondary_index() {
+    cleanup();
+    constexpr int N = 5000;
+    xdl::DB db(test_db_path(), default_schema(), xdl::CompressionType::LZ4, 64);
+    db.open();
+    for (int i = 0; i < N; ++i)
+        db.insert(make_row(static_cast<uint32_t>(i), i % 100,
+                           "idx_" + std::to_string(i)));
+    db.create_index("age");
+    db.checkpoint();
+    // Point lookups for every possible age value.
+    for (uint32_t age = 0; age < 100; ++age) {
+        auto rows = db.index_range_scan("age",
+            std::optional<xdl::FieldValue>{age}, true,
+            std::optional<xdl::FieldValue>{age}, true);
+        ASSERT_EQ(rows.size(), (size_t)(N / 100));
+        for (auto& r : rows)
+            ASSERT_EQ(r.get_uint32(db.schema(), "age"), age);
+    }
+    // Range scan across the whole domain.
+    auto all = db.index_range_scan("age",
+        std::optional<xdl::FieldValue>{uint32_t(0)}, true,
+        std::optional<xdl::FieldValue>{uint32_t(99)}, true);
+    ASSERT_EQ(all.size(), (size_t)N);
+    db.close();
+}
+
+void test_stress_no_compression() {
+    cleanup();
+    constexpr int N = 5000;
+    xdl::DB db(test_db_path(), default_schema(), xdl::CompressionType::None, 32);
+    db.open();
+    LCG rng;
+    for (int i = 0; i < N; ++i)
+        db.insert(make_row(static_cast<uint32_t>(i), rng.range(0, 999),
+                           "nc_" + std::to_string(i)));
+    db.checkpoint();
+    for (int i = 0; i < N; ++i) {
+        xdl::Row r = db.get(static_cast<uint32_t>(i));
+        ASSERT_EQ(r.id, static_cast<uint32_t>(i));
+    }
+    auto all = db.scan_all();
+    ASSERT_EQ(all.size(), (size_t)N);
+    db.close();
+}
+
+void test_stress_reopen_many_times() {
+    cleanup();
+    for (int round = 0; round < 30; ++round) {
+        xdl::DB db(test_db_path(), default_schema());
+        db.open();
+        for (uint32_t i = 0; i < 20; ++i) {
+            uint32_t id = round * 20 + i;
+            db.insert(make_row(id, id, "reopen_" + std::to_string(id)));
+        }
+        db.checkpoint();
+        db.close();
+    }
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    auto s = db.stats();
+    ASSERT_EQ(s.row_count, (size_t)600);
+    for (int i = 0; i < 600; ++i) {
+        xdl::Row r = db.get(static_cast<uint32_t>(i));
+        ASSERT_EQ(r.id, static_cast<uint32_t>(i));
+    }
+    db.close();
+}
+
+void test_stress_wide_schema() {
+    cleanup();
+    constexpr int FIELDS = 16;
+    constexpr int N      = 2000;
+    xdl::Schema s;
+    for (int i = 0; i < FIELDS; ++i)
+        s.fields.push_back({"f" + std::to_string(i), xdl::FieldType::UINT32});
+    xdl::DB db(test_db_path(), s, xdl::CompressionType::LZ4, 32);
+    db.open();
+    LCG rng;
+    for (int i = 0; i < N; ++i) {
+        std::vector<xdl::FieldValue> vals;
+        vals.reserve(FIELDS);
+        for (int f = 0; f < FIELDS; ++f)
+            vals.emplace_back(rng.range(0, 100000));
+        db.insert(xdl::Row{static_cast<uint32_t>(i), std::move(vals)});
+    }
+    db.checkpoint();
+    LCG verify;
+    for (int i = 0; i < N; ++i) {
+        xdl::Row r = db.get(static_cast<uint32_t>(i));
+        ASSERT_EQ(r.id, static_cast<uint32_t>(i));
+        for (int f = 0; f < FIELDS; ++f)
+            ASSERT_EQ(r.get_uint32(s, "f" + std::to_string(f)),
+                      verify.range(0, 100000));
+    }
+    auto all = db.scan_all();
+    ASSERT_EQ(all.size(), (size_t)N);
+    db.close();
+}
+
+void test_stress_scan_filter_verify() {
+    cleanup();
+    constexpr int N = 3000;
+    xdl::DB db(test_db_path(), default_schema(), xdl::CompressionType::LZ4, 32);
+    db.open();
+    for (int i = 0; i < N; ++i)
+        db.insert(make_row(static_cast<uint32_t>(i), i % 100,
+                           "sf_" + std::to_string(i)));
+    for (uint32_t lo = 0; lo <= 95; lo += 5) {
+        xdl::ScanFilter f;
+        f.min("age", lo).max("age", lo + 4);
+        auto rows = db.scan_all(f);
+        size_t expected = 0;
+        for (int i = 0; i < N; ++i)
+            if (i % 100 >= static_cast<int>(lo) && i % 100 <= static_cast<int>(lo) + 4)
+                expected++;
+        ASSERT_EQ(rows.size(), expected);
+    }
+    xdl::ScanFilter prefix;
+    prefix.starts("name", "sf_");
+    auto all = db.scan_all(prefix);
+    ASSERT_EQ(all.size(), (size_t)N);
+    db.close();
+}
+
+// ---------------------------------------------------------------------------
+// Batch writes, delete/update, schema adoption
+// ---------------------------------------------------------------------------
+
+void test_insert_batch_basic() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+
+    std::vector<xdl::Row> rows;
+    for (uint32_t i = 0; i < 200; ++i)
+        rows.push_back(make_row(i, i, "batch_" + std::to_string(i)));
+
+    ASSERT_EQ(db.insert_batch(rows), (size_t)200);
+    ASSERT_EQ(db.stats().row_count, (size_t)200);
+    for (uint32_t i = 0; i < 200; ++i) {
+        auto r = db.get(i);
+        ASSERT_EQ(r.get_uint32(db.schema(), "age"), i);
+        ASSERT_EQ(r.get_string(db.schema(), "name"),
+                  "batch_" + std::to_string(i));
+    }
+    db.close();
+}
+
+void test_insert_batch_empty() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    ASSERT_EQ(db.insert_batch({}), (size_t)0);
+    ASSERT_EQ(db.stats().row_count, (size_t)0);
+    db.close();
+}
+
+void test_insert_batch_rejects_existing_duplicate() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    db.insert(make_row(1, 10, "existing"));
+
+    std::vector<xdl::Row> rows = {
+        make_row(1, 20, "dup"),
+        make_row(2, 30, "new"),
+    };
+    ASSERT_THROWS(db.insert_batch(rows), xdl::DuplicateKeyError);
+    // Validation happens before any write: neither row may be applied.
+    ASSERT_EQ(db.stats().row_count, (size_t)1);
+    xdl::Row r;
+    ASSERT(!db.try_get(2, r));
+    db.close();
+}
+
+void test_insert_batch_rejects_internal_duplicate() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+
+    std::vector<xdl::Row> rows = {
+        make_row(7, 1, "a"),
+        make_row(7, 2, "b"),
+    };
+    ASSERT_THROWS(db.insert_batch(rows), xdl::DuplicateKeyError);
+    ASSERT_EQ(db.stats().row_count, (size_t)0);
+    db.close();
+}
+
+void test_insert_batch_rejects_wrong_field_type() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+
+    std::vector<xdl::Row> rows = {
+        make_row(1, 10, "ok"),
+        // "age" must be uint32, not a string.
+        xdl::Row{2, {xdl::FieldValue{std::string("bad")},
+                     xdl::FieldValue{std::string("row")}}},
+    };
+    ASSERT_THROWS(db.insert_batch(rows), xdl::XDLError);
+    ASSERT_EQ(db.stats().row_count, (size_t)0);
+    db.close();
+}
+
+void test_erase_basic() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    for (uint32_t i = 0; i < 10; ++i)
+        db.insert(make_row(i, i * 10, "row" + std::to_string(i)));
+
+    db.erase(5);
+    ASSERT_EQ(db.stats().row_count, (size_t)9);
+
+    xdl::Row r;
+    ASSERT(!db.try_get(5, r));
+    ASSERT_EQ(db.get(4).get_string(db.schema(), "name"), std::string("row4"));
+    ASSERT_EQ(db.get(6).get_string(db.schema(), "name"), std::string("row6"));
+
+    auto all = db.scan_all();
+    ASSERT_EQ(all.size(), (size_t)9);
+    for (const auto& row : all)
+        ASSERT(row.id != 5);
+    db.close();
+}
+
+void test_erase_not_found() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    ASSERT_THROWS(db.erase(42), xdl::NotFoundError);
+    db.close();
+}
+
+void test_erase_persists_across_reopen() {
+    cleanup();
+    {
+        xdl::DB db(test_db_path(), default_schema());
+        db.open();
+        for (uint32_t i = 0; i < 5; ++i)
+            db.insert(make_row(i, i, "e" + std::to_string(i)));
+        db.erase(2);
+        db.close();
+    }
+    {
+        xdl::DB db(test_db_path(), default_schema());
+        db.open();
+        ASSERT_EQ(db.stats().row_count, (size_t)4);
+        xdl::Row r;
+        ASSERT(!db.try_get(2, r));
+        ASSERT_EQ(db.get(3).get_string(db.schema(), "name"), std::string("e3"));
+        db.close();
+    }
+}
+
+void test_erase_many_rows_repairs_slots() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    constexpr uint32_t N = 300;
+    for (uint32_t i = 0; i < N; ++i)
+        db.insert(make_row(i, i, "m" + std::to_string(i)));
+
+    for (uint32_t i = 0; i < N; i += 2)
+        db.erase(i);
+
+    ASSERT_EQ(db.stats().row_count, (size_t)(N / 2));
+    for (uint32_t i = 1; i < N; i += 2) {
+        auto r = db.get(i);
+        ASSERT_EQ(r.get_uint32(db.schema(), "age"), i);
+        ASSERT_EQ(r.get_string(db.schema(), "name"), "m" + std::to_string(i));
+    }
+    db.close();
+}
+
+void test_erase_updates_secondary_index() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    for (uint32_t i = 0; i < 20; ++i)
+        db.insert(make_row(i, i, "idx" + std::to_string(i)));
+    db.create_index("age");
+
+    db.erase(5);
+    auto gone = db.index_range_scan("age",
+        std::optional<xdl::FieldValue>{uint32_t(5)}, true,
+        std::optional<xdl::FieldValue>{uint32_t(5)}, true);
+    ASSERT(gone.empty());
+
+    auto four = db.index_range_scan("age",
+        std::optional<xdl::FieldValue>{uint32_t(4)}, true,
+        std::optional<xdl::FieldValue>{uint32_t(4)}, true);
+    ASSERT_EQ(four.size(), (size_t)1);
+    ASSERT_EQ(four[0].id, (uint32_t)4);
+    db.close();
+}
+
+void test_update_basic() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    db.insert(make_row(1, 10, "old"));
+
+    db.update(make_row(1, 20, "a_much_longer_new_value"));
+    ASSERT_EQ(db.stats().row_count, (size_t)1);
+
+    auto r = db.get(1);
+    ASSERT_EQ(r.id, (uint32_t)1);
+    ASSERT_EQ(r.get_uint32(db.schema(), "age"), (uint32_t)20);
+    ASSERT_EQ(r.get_string(db.schema(), "name"),
+              std::string("a_much_longer_new_value"));
+    ASSERT_EQ(db.scan_all().size(), (size_t)1);
+    db.close();
+}
+
+void test_update_not_found() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    ASSERT_THROWS(db.update(make_row(99, 1, "nope")), xdl::NotFoundError);
+    ASSERT_EQ(db.stats().row_count, (size_t)0);
+    db.close();
+}
+
+void test_update_shrink_and_grow() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    db.insert(make_row(1, 1, std::string(1000, 'a')));
+
+    db.update(make_row(1, 2, "b"));
+    ASSERT_EQ(db.get(1).get_string(db.schema(), "name"), std::string("b"));
+
+    db.update(make_row(1, 3, std::string(2000, 'c')));
+    ASSERT_EQ(db.get(1).get_string(db.schema(), "name"), std::string(2000, 'c'));
+    ASSERT_EQ(db.get(1).get_uint32(db.schema(), "age"), (uint32_t)3);
+    db.close();
+}
+
+void test_update_persists_across_reopen() {
+    cleanup();
+    {
+        xdl::DB db(test_db_path(), default_schema());
+        db.open();
+        db.insert(make_row(1, 10, "before"));
+        db.update(make_row(1, 99, "after"));
+        db.close();
+    }
+    {
+        xdl::DB db(test_db_path(), default_schema());
+        db.open();
+        auto r = db.get(1);
+        ASSERT_EQ(r.get_uint32(db.schema(), "age"), (uint32_t)99);
+        ASSERT_EQ(r.get_string(db.schema(), "name"), std::string("after"));
+        db.close();
+    }
+}
+
+void test_update_secondary_index() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    for (uint32_t i = 0; i < 10; ++i)
+        db.insert(make_row(i, i, "u" + std::to_string(i)));
+    db.create_index("age");
+
+    db.update(make_row(5, 100, "u5_updated"));
+
+    auto old_val = db.index_range_scan("age",
+        std::optional<xdl::FieldValue>{uint32_t(5)}, true,
+        std::optional<xdl::FieldValue>{uint32_t(5)}, true);
+    ASSERT(old_val.empty());
+
+    auto new_val = db.index_range_scan("age",
+        std::optional<xdl::FieldValue>{uint32_t(100)}, true,
+        std::optional<xdl::FieldValue>{uint32_t(100)}, true);
+    ASSERT_EQ(new_val.size(), (size_t)1);
+    ASSERT_EQ(new_val[0].id, (uint32_t)5);
+    ASSERT_EQ(new_val[0].get_string(db.schema(), "name"),
+              std::string("u5_updated"));
+    db.close();
+}
+
+void test_erase_batch_basic() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    for (uint32_t i = 0; i < 100; ++i)
+        db.insert(make_row(i, i, "b" + std::to_string(i)));
+    db.create_index("age");
+
+    std::vector<uint32_t> ids;
+    for (uint32_t i = 0; i < 100; i += 2) ids.push_back(i);
+
+    ASSERT_EQ(db.erase_batch(ids), (size_t)50);
+    ASSERT_EQ(db.stats().row_count, (size_t)50);
+
+    for (uint32_t i = 0; i < 100; ++i) {
+        xdl::Row r;
+        if (i % 2 == 0) {
+            ASSERT(!db.try_get(i, r));
+        } else {
+            ASSERT(db.try_get(i, r));
+            ASSERT_EQ(r.get_uint32(db.schema(), "age"), i);
+        }
+    }
+
+    // Secondary index must no longer contain deleted values.
+    auto gone = db.index_range_scan("age",
+        std::optional<xdl::FieldValue>{uint32_t(0)}, true,
+        std::optional<xdl::FieldValue>{uint32_t(9)}, true);
+    ASSERT_EQ(gone.size(), (size_t)5);
+    for (const auto& row : gone) ASSERT(row.id % 2 == 1);
+    db.close();
+}
+
+void test_erase_batch_validation_is_atomic() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    for (uint32_t i = 0; i < 5; ++i)
+        db.insert(make_row(i, i, "v" + std::to_string(i)));
+
+    // One missing id rejects the whole batch before any deletion happens.
+    ASSERT_THROWS(db.erase_batch({1, 3, 99}), xdl::NotFoundError);
+    ASSERT_EQ(db.stats().row_count, (size_t)5);
+
+    ASSERT_THROWS(db.erase_batch({1, 1}), xdl::DuplicateKeyError);
+    ASSERT_EQ(db.stats().row_count, (size_t)5);
+    db.close();
+}
+
+void test_update_batch_basic() {
+    cleanup();
+    {
+        xdl::DB db(test_db_path(), default_schema());
+        db.open();
+        for (uint32_t i = 0; i < 100; ++i)
+            db.insert(make_row(i, i, "old" + std::to_string(i)));
+        db.create_index("age");
+
+        std::vector<xdl::Row> updates;
+        for (uint32_t i = 0; i < 100; i += 2)
+            updates.push_back(make_row(i, 1000 + i, "new" + std::to_string(i)));
+
+        ASSERT_EQ(db.update_batch(updates), (size_t)50);
+        ASSERT_EQ(db.stats().row_count, (size_t)100);
+
+        for (uint32_t i = 0; i < 100; ++i) {
+            auto r = db.get(i);
+            if (i % 2 == 0) {
+                ASSERT_EQ(r.get_uint32(db.schema(), "age"), 1000 + i);
+                ASSERT_EQ(r.get_string(db.schema(), "name"),
+                          "new" + std::to_string(i));
+            } else {
+                ASSERT_EQ(r.get_uint32(db.schema(), "age"), i);
+                ASSERT_EQ(r.get_string(db.schema(), "name"),
+                          "old" + std::to_string(i));
+            }
+        }
+
+        auto updated = db.index_range_scan("age",
+            std::optional<xdl::FieldValue>{uint32_t(1000)}, true,
+            std::optional<xdl::FieldValue>{uint32_t(1000)}, true);
+        ASSERT_EQ(updated.size(), (size_t)1);
+        ASSERT_EQ(updated[0].id, (uint32_t)0);
+        db.close();
+    }
+    {
+        // And the batch survives a reopen.
+        xdl::DB db(test_db_path(), default_schema());
+        db.open();
+        ASSERT_EQ(db.get(2).get_string(db.schema(), "name"), std::string("new2"));
+        ASSERT_EQ(db.get(3).get_string(db.schema(), "name"), std::string("old3"));
+        db.close();
+    }
+}
+
+void test_update_batch_validation_is_atomic() {
+    cleanup();
+    xdl::DB db(test_db_path(), default_schema());
+    db.open();
+    for (uint32_t i = 0; i < 5; ++i)
+        db.insert(make_row(i, i, "w" + std::to_string(i)));
+
+    ASSERT_THROWS(db.update_batch({make_row(1, 10, "changed"),
+                                   make_row(99, 20, "missing")}),
+                  xdl::NotFoundError);
+    ASSERT_EQ(db.get(1).get_string(db.schema(), "name"), std::string("w1"));
+
+    ASSERT_THROWS(db.update_batch({make_row(1, 10, "a"),
+                                   make_row(1, 20, "b")}),
+                  xdl::DuplicateKeyError);
+    ASSERT_EQ(db.get(1).get_string(db.schema(), "name"), std::string("w1"));
+    db.close();
+}
+
+void test_delete_wal_replay() {
+    cleanup();
+    // Persist one row and checkpoint so the page is on disk.
+    {
+        xdl::DB db(test_db_path(), default_schema());
+        db.open();
+        db.insert(make_row(1, 10, "doomed"));
+        db.checkpoint();
+        db.close();
+    }
+
+    // Simulate a crash after the DELETE was logged but before the page flush.
+    {
+        xdl::WAL wal(test_db_path() + ".wal");
+        wal.open();
+        wal.log_delete(1, 0, 0);
+        wal.close();
+    }
+
+    // Replay must remove the row from both page and index.
+    {
+        xdl::DB db(test_db_path(), default_schema());
+        db.open();
+        ASSERT_EQ(db.stats().row_count, (size_t)0);
+        xdl::Row r;
+        ASSERT(!db.try_get(1, r));
+        db.close();
+    }
+    // And the deletion must survive a second reopen.
+    {
+        xdl::DB db(test_db_path(), default_schema());
+        db.open();
+        ASSERT_EQ(db.stats().row_count, (size_t)0);
+        xdl::Row r;
+        ASSERT(!db.try_get(1, r));
+        db.close();
+    }
+}
+
+void test_open_adopts_stored_schema() {
+    cleanup();
+    xdl::Schema custom = {
+        {"a", xdl::FieldType::UINT32},
+        {"b", xdl::FieldType::STRING},
+        {"c", xdl::FieldType::INT64},
+    };
+    {
+        xdl::DB db(test_db_path(), custom);
+        db.open();
+        db.insert(xdl::Row{1, {xdl::FieldValue{uint32_t(7)},
+                               xdl::FieldValue{std::string("x")},
+                               xdl::FieldValue{int64_t(-3)}}});
+        db.close();
+    }
+    {
+        // No explicit schema: adopt the on-disk schema instead of overwriting.
+        xdl::DB db(test_db_path());
+        db.open();
+        ASSERT_EQ(db.schema().fields.size(), (size_t)3);
+        ASSERT_EQ(db.schema().fields[0].name, std::string("a"));
+        ASSERT_EQ(db.schema().fields[2].name, std::string("c"));
+        auto r = db.get(1);
+        ASSERT_EQ(r.get_int64(2), (int64_t)-3);
+        db.close();
+    }
+}
+
+void test_open_rejects_incompatible_schema() {
+    cleanup();
+    xdl::Schema original = {{"a", xdl::FieldType::UINT32}};
+    {
+        xdl::DB db(test_db_path(), original);
+        db.open();
+        db.insert(xdl::Row{1, {xdl::FieldValue{uint32_t(123)}}});
+        db.close();
+    }
+    xdl::Schema wrong = {{"a", xdl::FieldType::STRING}};
+    ASSERT_THROWS({
+        xdl::DB db(test_db_path(), wrong);
+        db.open();
+    }, xdl::MigrationError);
+
+    // The failed open must not have damaged the data.
+    {
+        xdl::DB db(test_db_path(), original);
+        db.open();
+        ASSERT_EQ(db.get(1).get_uint32(0), (uint32_t)123);
+        db.close();
+    }
+}
+
+void test_string_over_65535_throws() {
+    cleanup();
+    xdl::Schema s = {{"v", xdl::FieldType::STRING}};
+    xdl::DB db(test_db_path(), s);
+    db.open();
+    std::string huge(70000, 'x');
+    ASSERT_THROWS(db.insert(xdl::Row{1, {xdl::FieldValue{huge}}}), xdl::XDLError);
+    ASSERT_EQ(db.stats().row_count, (size_t)0);
+    db.close();
+}
+
+void test_bptree_long_string_keys() {
+    xdl::BPTree tree;
+    std::string a = "prefix_that_is_longer_than_thirty_two_bytes_AAA";
+    std::string b = "prefix_that_is_longer_than_thirty_two_bytes_BBB";
+    std::string c = "prefix_that_is_longer_than_thirty_two_bytes_CCC";
+
+    tree.insert(xdl::FieldValue{a}, xdl::FieldType::STRING, 1);
+    tree.insert(xdl::FieldValue{b}, xdl::FieldType::STRING, 2);
+
+    auto* ids = tree.find(xdl::FieldValue{b}, xdl::FieldType::STRING);
+    ASSERT(ids != nullptr);
+    ASSERT_EQ(ids->size(), (size_t)1);
+    ASSERT_EQ((*ids)[0], (uint32_t)2);
+
+    // Keys sharing the first 32 bytes must not collide.
+    ASSERT(tree.find(xdl::FieldValue{c}, xdl::FieldType::STRING) == nullptr);
+
+    tree.erase(xdl::FieldValue{b}, xdl::FieldType::STRING, 2);
+    ASSERT(tree.find(xdl::FieldValue{b}, xdl::FieldType::STRING) == nullptr);
+    ASSERT(tree.find(xdl::FieldValue{a}, xdl::FieldType::STRING) != nullptr);
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -2120,6 +2937,32 @@ int main() {
     RUN_TEST(test_empty_string_field);
     RUN_TEST(test_very_long_string_field);
     RUN_TEST(test_stats_after_many_inserts);
+
+    // Batch writes, delete/update, schema adoption
+    RUN_TEST(test_insert_batch_basic);
+    RUN_TEST(test_insert_batch_empty);
+    RUN_TEST(test_insert_batch_rejects_existing_duplicate);
+    RUN_TEST(test_insert_batch_rejects_internal_duplicate);
+    RUN_TEST(test_insert_batch_rejects_wrong_field_type);
+    RUN_TEST(test_erase_basic);
+    RUN_TEST(test_erase_not_found);
+    RUN_TEST(test_erase_persists_across_reopen);
+    RUN_TEST(test_erase_many_rows_repairs_slots);
+    RUN_TEST(test_erase_updates_secondary_index);
+    RUN_TEST(test_erase_batch_basic);
+    RUN_TEST(test_erase_batch_validation_is_atomic);
+    RUN_TEST(test_update_basic);
+    RUN_TEST(test_update_not_found);
+    RUN_TEST(test_update_shrink_and_grow);
+    RUN_TEST(test_update_persists_across_reopen);
+    RUN_TEST(test_update_secondary_index);
+    RUN_TEST(test_update_batch_basic);
+    RUN_TEST(test_update_batch_validation_is_atomic);
+    RUN_TEST(test_delete_wal_replay);
+    RUN_TEST(test_open_adopts_stored_schema);
+    RUN_TEST(test_open_rejects_incompatible_schema);
+    RUN_TEST(test_string_over_65535_throws);
+    RUN_TEST(test_bptree_long_string_keys);
 
     // WAL
     RUN_TEST(test_wal_basic);
@@ -2260,6 +3103,20 @@ int main() {
     // ScanFilter
     RUN_TEST(test_scan_filter_no_constraints_matches_all);
     RUN_TEST(test_scan_filter_matches_string_eq);
+
+    // Stress
+    RUN_TEST(test_stress_bulk_insert_get);
+    RUN_TEST(test_stress_randomized_roundtrip);
+    RUN_TEST(test_stress_concurrent_writers);
+    RUN_TEST(test_stress_concurrent_mixed);
+    RUN_TEST(test_stress_checkpoint_cycles);
+    RUN_TEST(test_stress_large_strings);
+    RUN_TEST(test_row_too_large_throws);
+    RUN_TEST(test_stress_secondary_index);
+    RUN_TEST(test_stress_no_compression);
+    RUN_TEST(test_stress_reopen_many_times);
+    RUN_TEST(test_stress_wide_schema);
+    RUN_TEST(test_stress_scan_filter_verify);
 
     std::cout << "\n--- Results ---\n"
               << "Passed: " << tests_pass << "/" << tests_run << "\n";

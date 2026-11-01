@@ -25,6 +25,8 @@
 //
 //  Commands:
 //    insert <id> <field1_value> <field2_value> ...
+//    update <id> <field1_value> <field2_value> ...
+//    delete <id>
 //    get    <id>
 //    scan   [--<field> <value>]  [--min-<field> N]  [--max-<field> N]
 //           [--prefix-<field> STR]
@@ -100,6 +102,8 @@ static void print_help(const xdl::Schema& schema) {
     std::cout <<
         "Commands:\n"
         "  insert <id> <v1> [<v2> ...]      Insert a row (values in schema order)\n"
+        "  update <id> <v1> [<v2> ...]      Replace an existing row\n"
+        "  delete <id>                       Delete a row by id\n"
         "  get    <id>                       Retrieve row by id\n"
         "  scan   [--<field> <val>]\n"
         "         [--min-<field> N]\n"
@@ -173,6 +177,44 @@ static void handle_get(xdl::DB& db, std::istringstream& ss) {
     } else {
         std::cerr << "Not found: " << id << "\n";
     }
+}
+
+static void handle_delete(xdl::DB& db, std::istringstream& ss) {
+    uint32_t id;
+    if (!(ss >> id)) {
+        std::cerr << "Usage: delete <id>\n";
+        return;
+    }
+    db.erase(id);
+    std::cout << "Deleted id=" << id << "\n";
+}
+
+static void handle_update(xdl::DB& db, std::istringstream& ss) {
+    const xdl::Schema& schema = db.schema();
+    uint32_t id;
+    if (!(ss >> id)) {
+        std::cerr << "Usage: update <id> <field_values...>\n";
+        return;
+    }
+
+    std::vector<xdl::FieldValue> fv;
+    for (const auto& fd : schema.fields) {
+        std::string tok;
+        if (!(ss >> tok)) {
+            std::cerr << "Missing value for field '" << fd.name << "'\n";
+            return;
+        }
+        try {
+            fv.push_back(parse_value(tok, fd.type));
+        } catch (...) {
+            std::cerr << "Field '" << fd.name << "' expects " << xdl::field_type_name(fd.type)
+                      << "; got: " << tok << "\n";
+            return;
+        }
+    }
+
+    db.update(xdl::Row{id, std::move(fv)});
+    std::cout << "Updated id=" << id << "\n";
 }
 
 static void handle_scan(xdl::DB& db, std::istringstream& ss) {
@@ -305,6 +347,8 @@ int main(int argc, char* argv[]) {
 
         try {
             if      (cmd == "insert")     handle_insert(db, ss);
+            else if (cmd == "update")     handle_update(db, ss);
+            else if (cmd == "delete" || cmd == "erase") handle_delete(db, ss);
             else if (cmd == "get")        handle_get(db, ss);
             else if (cmd == "scan")       handle_scan(db, ss);
             else if (cmd == "index") {

@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <list>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <mutex>
 
@@ -25,7 +26,15 @@ public:
 
     // Returns std::nullopt if not cached.  The copy is made while
     // the lock is held, so the caller can use the Page safely.
+    //
+    // Prefer get_shared() for read paths: it avoids copying the whole page
+    // (up to PAGE_SIZE bytes) on every lookup.
     std::optional<Page> get(uint32_t page_id);
+
+    // Returns a shared, immutable view of the cached page.  The page stays
+    // alive for as long as the caller holds the pointer, even if it is
+    // evicted from the cache concurrently.
+    std::shared_ptr<const Page> get_shared(uint32_t page_id);
 
     // Returns a raw pointer into the cache (lock released on return).
     // ONLY safe when the caller holds an exclusive lock (no concurrent readers).
@@ -33,6 +42,12 @@ public:
 
     // Insert or replace.  May evict the LRU entry.
     void put(Page page);
+
+    // Insert an already-allocated page (avoids a second copy on load).
+    // Returns the page that is now resident: the supplied page, or the
+    // existing cached copy if one was inserted concurrently.  Callers must
+    // use the returned pointer rather than the argument.
+    std::shared_ptr<Page> put_shared(std::shared_ptr<Page> page);
 
     // Forcibly remove a page (e.g. after explicit flush)
     void evict(uint32_t page_id);
@@ -48,7 +63,7 @@ public:
     void for_each_dirty(Fn&& fn) {
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto& [id, it] : map_) {
-            if (it->dirty) fn(*it);
+            if ((*it)->dirty) fn(*(*it));
         }
     }
 
@@ -60,9 +75,13 @@ private:
 
     mutable std::mutex mtx_;
 
-    // LRU list: front = most recently used
-    std::list<Page>                                          lru_;
-    std::unordered_map<uint32_t, std::list<Page>::iterator> map_;
+    // LRU list: front = most recently used.  Pages are heap-allocated and
+    // shared with readers so a cache hit never copies page bytes.
+    using PagePtr = std::shared_ptr<Page>;
+    using LruList = std::list<PagePtr>;
+
+    LruList                                          lru_;
+    std::unordered_map<uint32_t, LruList::iterator>  map_;
 };
 
 } // namespace xdl

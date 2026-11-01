@@ -41,14 +41,27 @@ public:
     void close();
     bool is_open() const;
 
-    // Write a WAL record for an insert.  Flushes to disk immediately (fsync).
+    // Write a WAL record for an insert.
+    // By default the record is flushed and fsync'd before returning, so it is
+    // durable on a crash.  Pass sync_now = false to batch many records and
+    // call sync() once afterwards (see DB::insert_batch).
     // Returns the byte offset of this WAL record in the file.
     uint64_t log_insert(uint32_t row_id, uint32_t page_id, uint32_t row_slot,
-                        const char* row_data, uint32_t row_data_len);
+                        const char* row_data, uint32_t row_data_len,
+                        bool sync_now = true);
 
     // Zero-copy variant: writes directly from caller's buffer (no intermediate copy).
     uint64_t log_insert_direct(uint32_t row_id, uint32_t page_id, uint32_t row_slot,
-                               const char* row_data, uint32_t row_data_len);
+                               const char* row_data, uint32_t row_data_len,
+                               bool sync_now = true);
+
+    // Write a DELETE record.  Replay removes the row from the page and index.
+    uint64_t log_delete(uint32_t row_id, uint32_t page_id, uint32_t row_slot,
+                        bool sync_now = true);
+
+    // Flush buffered records and fsync once.  Use after a batch of
+    // log_* calls made with sync_now = false.
+    void sync();
 
     // Write a COMMIT record (no data).  Called after page is flushed to main DB.
     void log_commit();
@@ -59,7 +72,7 @@ public:
     // Replay WAL: read all records and return them as a vector of WALRecord.
     // Any trailing corrupted/truncated record is silently ignored.
     struct WALRecord {
-        enum Type : uint8_t { INSERT = 0, COMMIT = 1, CHECKPOINT = 2, ROLLBACK = 3 };
+        enum Type : uint8_t { INSERT = 0, COMMIT = 1, CHECKPOINT = 2, ROLLBACK = 3, DELETE = 4 };
         Type       type;
         uint32_t   row_id;
         uint32_t   page_id;

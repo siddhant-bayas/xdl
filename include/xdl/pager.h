@@ -36,9 +36,10 @@ public:
     // Called once after open(): scan file, rebuild index, populate metadata.
     void recover();
 
-    // Load a page by ID (from cache or disk).  Returns a copy (safe for
-    // concurrent readers).
-    Page get_page(uint32_t page_id);
+    // Load a page by ID (from cache or disk).  Returns an immutable shared
+    // view so concurrent readers do not copy page bytes and remain safe even
+    // if the page is evicted while they hold it.
+    std::shared_ptr<const Page> get_page(uint32_t page_id);
 
     // Load a page by ID for mutation.  Caller must hold exclusive lock;
     // returns a reference into the cache (valid until next cache mutation
@@ -58,6 +59,9 @@ public:
     void flush_all();
 
     uint32_t page_count() const { return next_page_id_; }
+
+    // Number of pages currently resident in the buffer pool.
+    size_t cache_size() const { return cache_.size(); }
 
     // Translate page_id → file offset (used by IndexManager rebuild).
     uint64_t page_offset(uint32_t page_id) const;
